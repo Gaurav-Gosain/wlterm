@@ -35,11 +35,11 @@ func (c rgb) hex() string { return fmt.Sprintf("#%02X%02X%02X", c.r, c.g, c.b) }
 
 // charmtone, the ramp tuios's chrome is built from.
 var (
-	pepper = hexc("#201F26") // Canvas
-	bbq    = hexc("#2D2C36") // Panel
-	butter = hexc("#FFFAF1") // Fg
-	smoke  = hexc("#BFBCC8") // FgDim
-	squid  = hexc("#858392") // FgMute
+	pepper  = hexc("#201F26") // Canvas
+	bbq     = hexc("#2D2C36") // Panel
+	butter  = hexc("#FFFAF1") // Fg
+	smoke   = hexc("#BFBCC8") // FgDim
+	squid   = hexc("#858392") // FgMute
 	charple = hexc("#6B50FF") // Accent
 )
 
@@ -64,7 +64,8 @@ type palette struct {
 	focus     rgb // focused ring: >= 3:1
 	text      rgb // legible on the ground
 	dim       rgb
-	accent    rgb
+	accent    rgb // a mark: bars and rules, lifted to the mark floor
+	chip      rgb // a fill that carries ContrastText at the text floor
 	empty     rgb // a tile whose client has not drawn yet
 }
 
@@ -78,8 +79,10 @@ func initPalette() {
 		text:      butter,
 		dim:       smoke,
 		accent:    charple,
+		chip:      chipFill(charple, contrastFloor),
 		empty:     bbq,
 	}
+	initPanelPalette()
 }
 
 // relLum is the WCAG 2.x relative luminance of a colour.
@@ -118,27 +121,83 @@ func contrastText(bg rgb) rgb {
 	return pepper
 }
 
-// structureInk is tuios's Structure(): start from the most legible ink on
-// this ground and blend it back toward the ground, bisecting for the least
-// blend that still measures at or under the 1.9:1 target. A fixed grey
-// cannot do this job, because the quietest a single ink can be against both
-// black and white at once is 4.58:1, louder than the labels a rule is meant
-// to sit beneath.
-func structureInk(bg rgb) rgb {
+// inkAt starts from the most legible ink on this ground and blends it back
+// toward the ground, bisecting for the least blend that still measures at or
+// under `target`. Because contrast falls monotonically as the blend grows,
+// the result sits essentially exactly on the target, which makes it usable
+// both for quieting an ink down to the structure class and for finding the
+// quietest ink that still clears a legibility floor.
+//
+// A fixed grey cannot do this job, because the quietest a single ink can be
+// against both black and white at once is 4.58:1, louder than the labels a
+// rule is meant to sit beneath.
+func inkAt(bg rgb, target float64) rgb {
 	ink := contrastText(bg)
-	if contrast(ink, bg) <= structureTarget {
+	if contrast(ink, bg) <= target {
 		return ink
 	}
 	lo, hi := 0.0, 1.0
 	for i := 0; i < 16; i++ {
 		mid := (lo + hi) / 2
-		if contrast(mix(ink, bg, mid), bg) > structureTarget {
+		if contrast(mix(ink, bg, mid), bg) > target {
 			lo = mid
 		} else {
 			hi = mid
 		}
 	}
 	return mix(ink, bg, hi)
+}
+
+// structureInk is tuios's Structure(): the decorative-rule class, ~1.9:1.
+func structureInk(bg rgb) rgb { return inkAt(bg, structureTarget) }
+
+// inkAtLeast is inkAt for a floor rather than a target: the quietest ink
+// that still measures at or above it. inkAt lands a hair below its number,
+// which is right for a target and wrong for a floor, and "a hair below 4.5"
+// is not 4.5.
+func inkAtLeast(bg rgb, floor float64) rgb {
+	ink := contrastText(bg)
+	if contrast(ink, bg) <= floor {
+		return ink
+	}
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 20; i++ {
+		mid := (lo + hi) / 2
+		if contrast(mix(ink, bg, mid), bg) >= floor {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return mix(ink, bg, lo)
+}
+
+// chipFill prepares a fill that ContrastText can actually sit on. An accent
+// chosen as an accent is not chosen to carry text: charple measures 4.41:1
+// against the most legible chrome ink, just under the text floor. Rather
+// than pick a different ink for the label and give up ContrastText, the fill
+// is pushed away from its own text ink until the pair clears the floor.
+// Contrast only rises as the fill moves away, so the bisection is safe and
+// the hue is preserved.
+func chipFill(c rgb, floor float64) rgb {
+	ink := contrastText(c)
+	if contrast(ink, c) >= floor {
+		return c
+	}
+	away := pepper
+	if ink == pepper {
+		away = butter
+	}
+	lo, hi := 0.0, 1.0
+	for i := 0; i < 20; i++ {
+		mid := (lo + hi) / 2
+		if contrast(ink, mix(c, away, mid)) >= floor {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return mix(c, away, hi)
 }
 
 // readableAt lifts an ink away from its ground until it clears a floor,
@@ -161,6 +220,75 @@ func readableAt(c, bg rgb, floor float64) rgb {
 	return mix(c, target, hi)
 }
 
+// ---- the launcher panel ----
+//
+// The panel sits on its own ground, so every ink in it is recomputed against
+// THAT ground rather than inherited from the canvas. A dim ink that measures
+// 4.5:1 on the canvas measures something else on a lighter panel, and
+// "quiet" is a ratio, not a colour.
+
+type panelPalette struct {
+	fill    rgb // the panel ground
+	ring    rgb // border: a mark, so >= 3:1 against the canvas ground
+	rule    rgb // hairline inside the panel: the structure class, ~1.9:1
+	text    rgb // primary row text
+	dim     rgb // secondary text, sitting exactly on the 4.5:1 floor
+	hit     rgb // matched characters: the loudest ink the panel allows
+	selFill rgb // the selected row's slab
+	selBar  rgb // the accent bar owning the selected row: a mark, >= 3:1
+	selText rgb
+	selDim  rgb
+	selHit  rgb
+	prompt  rgb // the prompt chip fill
+}
+
+var panelPal panelPalette
+
+func initPanelPalette() {
+	fill := pal.empty
+	// A slab, not a hue swap: the selection has to read in a monochrome
+	// screenshot, and a fill this close to the panel keeps every text ratio
+	// on the row within a hair of the unselected ones.
+	sel := mix(fill, contrastText(fill), 0.11)
+	panelPal = panelPalette{
+		fill: fill,
+		// The ring is the accent, not the focused-pane green. Two green
+		// rings on one screen would have the panel and the tile behind it
+		// both claiming focus; the accent already means "wlterm's own
+		// surface" everywhere else in the frame, and it ties the panel to
+		// the dock chip it is drawn with.
+		ring:    readableAt(pal.accent, pal.ground, markFloor),
+		rule:    inkAt(fill, structureTarget),
+		text:    inkAtLeast(fill, 7.0),
+		dim:     inkAtLeast(fill, contrastFloor),
+		hit:     contrastText(fill),
+		selFill: sel,
+		selBar:  readableAt(pal.accent, sel, markFloor),
+		selText: inkAtLeast(sel, 7.0),
+		selDim:  inkAtLeast(sel, contrastFloor),
+		selHit:  contrastText(sel),
+		prompt:  chipFill(pal.accent, contrastFloor),
+	}
+}
+
+// reportPanelContrast logs the launcher's ratios the same way the frame's
+// are logged, so "quiet rules, legible text" stays a measured property when
+// a second surface with its own ground is added.
+func reportPanelContrast() string {
+	p := panelPal
+	return fmt.Sprintf(
+		"panel fill=%s ring=%s (%.2f:1 on canvas, floor %.1f) rule=%.2f:1 "+
+			"text=%.2f:1 dim=%.2f:1 hit=%.2f:1 | sel fill=%s bar=%.2f:1 "+
+			"text=%.2f:1 dim=%.2f:1 hit=%.2f:1 | prompt=%s chip-text=%.2f:1",
+		p.fill.hex(), p.ring.hex(), contrast(p.ring, pal.ground), markFloor,
+		contrast(p.rule, p.fill), contrast(p.text, p.fill),
+		contrast(p.dim, p.fill), contrast(p.hit, p.fill),
+		p.selFill.hex(), contrast(p.selBar, p.selFill),
+		contrast(p.selText, p.selFill), contrast(p.selDim, p.selFill),
+		contrast(p.selHit, p.selFill),
+		p.prompt.hex(), contrast(contrastText(p.prompt), p.prompt))
+}
+
 // reportContrast logs every relationship in the frame so "quiet rules,
 // legible text" is a measured property rather than an asserted one.
 func reportContrast() string {
@@ -171,7 +299,9 @@ func reportContrast() string {
 		pal.focus.hex(), contrast(pal.focus, pal.ground), markFloor,
 		contrast(contrastText(pal.structure), pal.structure),
 		contrast(contrastText(pal.focus), pal.focus),
-		contrast(pal.text, pal.ground))
+		contrast(pal.text, pal.ground)) +
+		fmt.Sprintf(" chip=%s chip-text=%.2f:1 (floor %.1f)",
+			pal.chip.hex(), contrast(contrastText(pal.chip), pal.chip), contrastFloor)
 }
 
 // ---- primitives ----
@@ -457,8 +587,8 @@ func (r *renderer) drawDock() {
 	}
 	x := cellW
 	pw := len(label)*atlas.w + 2*atlas.w
-	pill(dst, cw, chh, rect{x, py, x + pw, py + ph}, pal.accent)
-	drawText(dst, cw, chh, x+atlas.w, py+1, label, contrastText(pal.accent), atlas)
+	pill(dst, cw, chh, rect{x, py, x + pw, py + ph}, pal.chip)
+	drawText(dst, cw, chh, x+atlas.w, py+1, label, contrastText(pal.chip), atlas)
 
 	// Trailing counter, right aligned: layout mode and pane count.
 	idx := 0
@@ -472,7 +602,7 @@ func (r *renderer) drawDock() {
 	drawText(dst, cw, chh, rx, py+1, right, pal.dim, atlas)
 
 	// Hint strip in the middle, dimmed: the bindings that matter.
-	hint := fmt.Sprintf("%s then n split | tab focus | x close | z zoom | space layout", comp.prefixName)
+	hint := fmt.Sprintf("%s then d apps | n split | tab focus | x close | z zoom | space layout", comp.prefixName)
 	hx := x + pw + 2*cellW
 	if hx+len(hint)*atlas.w < rx-cellW {
 		drawText(dst, cw, chh, hx, py+1, hint, pal.structure, atlas)
@@ -564,6 +694,7 @@ func (r *renderer) drawSplash() {
 	lines := []string{
 		"wlterm",
 		"",
+		fmt.Sprintf("%s then d opens the app launcher", comp.prefixName),
 		fmt.Sprintf("%s then n opens a window", comp.prefixName),
 		fmt.Sprintf("%s then q quits", comp.prefixName),
 	}
