@@ -73,3 +73,52 @@ func kittyModsToXkb(m uint32) uint32 {
 	}
 	return x
 }
+
+// ---- evdev -> character, for the launcher's text field ----
+//
+// Every input path (kitty CSI u, SS3, legacy bytes) has been reduced to an
+// evdev code by the time a compositor binding sees it, and the launcher
+// needs the character back. US layout only, same caveat as the forward maps
+// above: a compositor that wanted real layouts would carry the xkb state it
+// already compiles for wl_keyboard instead of a table.
+var evdevToChar map[uint32][2]rune // [unshifted, shifted]
+
+func init() {
+	evdevToChar = make(map[uint32][2]rune, len(codeToEvdev))
+	for r, code := range codeToEvdev {
+		if r < 32 || r > 126 {
+			continue
+		}
+		e := evdevToChar[code]
+		e[0] = rune(r)
+		if r >= 'a' && r <= 'z' {
+			e[1] = rune(r) - 32
+		} else {
+			e[1] = rune(r)
+		}
+		evdevToChar[code] = e
+	}
+	for r, code := range shiftedToEvdev {
+		e := evdevToChar[code]
+		e[1] = r
+		evdevToChar[code] = e
+	}
+	evdevToChar[kcSpace] = [2]rune{' ', ' '}
+}
+
+// charForKey resolves a printable character, or reports that the key does
+// not produce one.
+func charForKey(code uint32, shift bool) (rune, bool) {
+	e, ok := evdevToChar[code]
+	if !ok {
+		return 0, false
+	}
+	r := e[0]
+	if shift {
+		r = e[1]
+	}
+	if r < 32 || r > 126 {
+		return 0, false
+	}
+	return r, true
+}

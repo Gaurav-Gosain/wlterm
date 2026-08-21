@@ -31,6 +31,23 @@ func snapshotLoop(comp *compositor, dir string, every time.Duration) {
 		}
 		img := image.NewRGBA(image.Rect(0, 0, w, h))
 		copy(img.Pix, comp.frame)
+		// The launcher overlay lives in its own buffer and is never written
+		// into comp.frame -- that is precisely what makes dismissing it
+		// free. So the capture instrument has to composite it the way the
+		// terminal does, or the snapshots would show a launcher-shaped hole.
+		if lc := comp.lc; lc != nil && lc.open && lc.pix != nil {
+			for y := 0; y < lc.pixH && lc.area.y0+y < h; y++ {
+				n := lc.pixW
+				if lc.area.x0+n > w {
+					n = w - lc.area.x0
+				}
+				if n <= 0 {
+					continue
+				}
+				copy(img.Pix[((lc.area.y0+y)*w+lc.area.x0)*4:],
+					lc.pix[y*lc.pixW*4:y*lc.pixW*4+n*4])
+			}
+		}
 		comp.mu.Unlock()
 
 		f, err := os.Create(fmt.Sprintf("%s/%06d.png", dir, n))

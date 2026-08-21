@@ -57,9 +57,19 @@ type compositor struct {
 	prefixMods  uint32
 	swallow     map[uint32]bool
 	spawnCmd    []string
-	spawn       func([]string)
+	termCmd     []string // wrapper for Terminal=true desktop entries
+	spawn       func(spawnReq)
 	quitFn      func()
-	freeImages  []uint32 // image ids whose placements must be deleted
+
+	// busSid is the session id of our private dbus-daemon. A service the
+	// bus activates is a child of the bus, not of the process that asked
+	// for it, so its windows carry the bus's session. Both count as ours.
+	busSid int
+
+	// lc is the application launcher: an overlay on the chrome layer with
+	// its own image, never a Wayland client.
+	lc         *launcher
+	freeImages []uint32 // image ids whose placements must be deleted
 
 	// Two levels of chrome repaint. A layout change repaints the whole
 	// canvas and costs every tile a recomposite; a focus or title change

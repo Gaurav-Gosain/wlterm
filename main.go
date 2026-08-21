@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,7 @@ func main() {
 	prefix := flag.String("prefix", "ctrl+b", "compositor leader key")
 	isolate := flag.Bool("isolate", true, "give clients a private runtime dir and session bus")
 	spawnCmd := flag.String("spawn", "foot", "command bound to <prefix> c")
+	termCmd := flag.String("term", "foot", "terminal used for Terminal=true desktop entries")
 	snapDir := flag.String("snapshots", "", "write composited PNGs into this directory")
 	snapEvery := flag.Duration("snapshot-every", 200*time.Millisecond, "snapshot interval")
 	var execs stringList
@@ -68,6 +70,7 @@ func main() {
 		spawnCmd:    []string{"/bin/sh", "-c", *spawnCmd},
 		prefixName:  *prefix,
 		swallow:     map[uint32]bool{},
+		termCmd:     defaultTermCmd(*termCmd),
 	}
 	if code, mods, ok := prefixFromName(*prefix); ok {
 		comp.prefixCode, comp.prefixMods = code, mods
@@ -106,6 +109,7 @@ func main() {
 	}
 	logf("mode=%s layers=%s size=%dx%d cell=%dx%d", *mode, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH)
 	logf("chrome: %s", reportContrast())
+	logf("chrome: %s", reportPanelContrast())
 
 	// Client isolation.
 	//
@@ -155,11 +159,12 @@ func main() {
 				return
 			}
 			c := &client{comp: comp, conn: conn, objects: map[uint32]object{}}
+			c.pid, c.sid = peerIdentity(conn)
 			c.objects[1] = wlDisplay{}
 			comp.mu.Lock()
 			comp.clients[c] = true
 			comp.mu.Unlock()
-			logf("client connected (%d total)", len(comp.clients))
+			logf("client connected: pid=%d sid=%d (%d total)", c.pid, c.sid, len(comp.clients))
 			go c.readLoop()
 		}
 	}()
@@ -179,8 +184,12 @@ func main() {
 	// never the host session's.
 	busAddr, stopBus := "", func() {}
 	if *isolate {
-		busAddr, stopBus = startPrivateBus(childRuntime)
+		var busPid int
+		busAddr, busPid, stopBus = startPrivateBus(childRuntime, sockName)
 		defer stopBus()
+		comp.mu.Lock()
+		comp.busSid = sessionOf(busPid)
+		comp.mu.Unlock()
 	}
 	childEnv := []string{}
 	for _, e := range os.Environ() {
@@ -203,9 +212,22 @@ func main() {
 	childExit := make(chan int, 8)
 	started := 0
 
-	launch := func(argv []string) {
+	launch := func(req spawnReq) {
+		argv := req.argv
+		if len(argv) == 0 {
+			return
+		}
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Env = childEnv
+		// Path= from a desktop entry is the working directory. A bad one
+		// is the entry's problem, not a reason to refuse the launch.
+		if req.dir != "" {
+			if st, err := os.Stat(req.dir); err == nil && st.IsDir() {
+				cmd.Dir = req.dir
+			} else {
+				logf("ignoring Path=%q for %s: %v", req.dir, req.name(), err)
+			}
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 		if logFile != nil {
 			cmd.Stdout = logFile
@@ -220,14 +242,23 @@ func main() {
 		children[pid] = cmd
 		started++
 		childMu.Unlock()
-		logf("spawned %v pid=%d", argv, pid)
+		logf("spawned %q pid=%d argv=%q", req.name(), pid, argv)
 		startedAt := time.Now()
+		// Setsid above makes the child a session leader, so its session id
+		// equals its pid and every descendant inherits it. That is the
+		// handle used to verify the launch below.
+		go verifyLaunch(comp, req, pid, startedAt)
 		go func() {
 			err := cmd.Wait()
+			lived := time.Since(startedAt)
 			comp.mu.Lock()
 			mapped := false
 			for _, w := range comp.windows {
-				if w.top != nil && w.top.client != nil {
+				if w.top == nil || w.top.client == nil {
+					continue
+				}
+				if w.top.client.sid == pid ||
+					(comp.busSid != 0 && w.top.client.sid == comp.busSid) {
 					mapped = true
 				}
 			}
@@ -235,26 +266,37 @@ func main() {
 			// A GUI client that exits in under a second having shown
 			// nothing is the signature of a launch that was handed off to
 			// another instance somewhere else. Say so loudly.
-			if !mapped && time.Since(startedAt) < time.Second {
-				logf("WARNING child %d (%v) exited after %v without a window: "+
+			if !mapped && lived < time.Second {
+				logf("WARNING child %d (%s) exited after %v without a window: "+
 					"if this is a GUI app it may have been handed to another instance",
-					pid, argv, time.Since(startedAt).Round(time.Millisecond))
+					pid, req.name(), lived.Round(time.Millisecond))
 			}
-			logf("child %d exited: %v", pid, err)
+			logf("child %d (%s) exited after %v: %v", pid, req.name(),
+				lived.Round(time.Millisecond), err)
 			childExit <- pid
 		}()
 	}
-	comp.spawn = func(argv []string) { go launch(argv) }
+	comp.spawn = func(req spawnReq) { go launch(req) }
 
 	quitOnce := sync.Once{}
 	quitCh := make(chan struct{})
 	comp.quitFn = func() { quitOnce.Do(func() { close(quitCh) }) }
 
+	// The launcher shares the child pipeline above, so a desktop entry gets
+	// exactly the isolation every other child gets: our socket, our runtime
+	// dir, our bus. That is not incidental. A launcher runs arbitrary
+	// desktop entries whose entire purpose is desktop integration, so it is
+	// the single feature most likely to reintroduce the escape that put a
+	// file manager on the host desktop.
+	comp.lc = newLauncher(comp, comp.nextImgID)
+	comp.nextImgID++
+	comp.lc.warm()
+
 	for _, e := range execs {
-		launch([]string{"/bin/sh", "-c", e})
+		launch(spawnReq{argv: []string{"/bin/sh", "-c", e}, label: e})
 	}
 	if args := flag.Args(); len(args) > 0 {
-		launch(args)
+		launch(spawnReq{argv: args})
 	}
 	if started == 0 {
 		logf("no initial client; use %s c", *prefix)
@@ -351,10 +393,18 @@ var leakyEnv = map[string]bool{
 // startPrivateBus runs a session bus that only our children can reach.
 // Without it, a client whose launcher goes through DBus activation opens its
 // window on whatever desktop owns the host bus.
-func startPrivateBus(dir string) (string, func()) {
+//
+// The bus's own environment matters as much as its address. A service the
+// bus activates inherits the BUS's environment, not the environment of the
+// process that asked for it, so a bus started without WAYLAND_DISPLAY
+// activates GTK applications that then die with "cannot open display".
+// Launching Thunar through the launcher found exactly that: isolation held
+// (nothing reached the host desktop) and the application was unusable.
+// So the bus is given our socket too.
+func startPrivateBus(dir, waylandSocket string) (addr string, pid int, stop func()) {
 	if _, err := exec.LookPath("dbus-daemon"); err != nil {
 		logf("dbus-daemon not found; clients get no session bus at all")
-		return "", func() {}
+		return "", 0, func() {}
 	}
 	cmd := exec.Command("dbus-daemon", "--session", "--nofork", "--print-address=1")
 	env := []string{}
@@ -364,10 +414,10 @@ func startPrivateBus(dir string) (string, func()) {
 		}
 		env = append(env, e)
 	}
-	cmd.Env = append(env, "XDG_RUNTIME_DIR="+dir)
+	cmd.Env = append(env, "XDG_RUNTIME_DIR="+dir, "WAYLAND_DISPLAY="+waylandSocket)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", func() {}
+		return "", 0, func() {}
 	}
 	if logFile != nil {
 		cmd.Stderr = logFile
@@ -375,21 +425,113 @@ func startPrivateBus(dir string) (string, func()) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		logf("private bus failed to start: %v", err)
-		return "", func() {}
+		return "", 0, func() {}
 	}
 	line := make([]byte, 4096)
 	n, _ := out.Read(line)
-	addr := strings.TrimSpace(string(line[:n]))
+	addr = strings.TrimSpace(string(line[:n]))
 	if addr == "" {
 		cmd.Process.Kill()
-		return "", func() {}
+		return "", 0, func() {}
 	}
-	logf("private session bus at %s", addr)
-	return addr, func() {
+	logf("private session bus at %s (pid %d)", addr, cmd.Process.Pid)
+	return addr, cmd.Process.Pid, func() {
 		if cmd.Process != nil {
 			syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		}
 	}
+}
+
+// peerIdentity reads the connecting process's credentials off the socket.
+// SyscallConn is used rather than conn.File() because File() dups the
+// descriptor and puts the connection into blocking mode.
+func peerIdentity(conn *net.UnixConn) (pid, sid int) {
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return 0, 0
+	}
+	rc.Control(func(fd uintptr) {
+		cred, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
+		if err == nil {
+			pid = int(cred.Pid)
+		}
+	})
+	if pid > 0 {
+		sid = sessionOf(pid)
+	}
+	return pid, sid
+}
+
+// sessionOf reads field 6 of /proc/<pid>/stat, the session id. The comm
+// field can contain spaces and parentheses, so parsing starts after its
+// closing paren rather than at the first space.
+func sessionOf(pid int) int {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	i := strings.LastIndexByte(string(b), ')')
+	if i < 0 {
+		return 0
+	}
+	f := strings.Fields(string(b[i+1:]))
+	// After ')': state ppid pgrp session ...
+	if len(f) < 4 {
+		return 0
+	}
+	sid, err := strconv.Atoi(f[3])
+	if err != nil {
+		return 0
+	}
+	return sid
+}
+
+// launchVerifyAfter is how long an application gets to put a window on
+// screen before the launch is reported as unverified.
+const launchVerifyAfter = 6 * time.Second
+
+// verifyLaunch checks the framebuffer, not the exit code.
+//
+// A zero exit means nothing here: the failure mode this exists for is a
+// desktop entry that hands its request to an already-running instance
+// somewhere else, exits 0, and shows the user nothing. So the check is
+// "does a mapped window belong to a process in the session we started",
+// which is exactly the question an exit code cannot answer.
+func verifyLaunch(comp *compositor, req spawnReq, pid int, startedAt time.Time) {
+	time.Sleep(launchVerifyAfter)
+	comp.mu.Lock()
+	busSid := comp.busSid
+	var mine, viaBus, others int
+	for _, w := range comp.windows {
+		if w.top == nil || w.top.client == nil || w.area.empty() {
+			continue
+		}
+		switch {
+		case w.top.client.sid == pid:
+			mine++
+		case busSid != 0 && w.top.client.sid == busSid:
+			// A DBus-activatable application is started by the bus, so its
+			// window belongs to the bus's session rather than to the pid we
+			// spawned. That is still inside wlterm; it is our bus.
+			viaBus++
+		default:
+			others++
+		}
+	}
+	comp.mu.Unlock()
+	if mine > 0 {
+		logf("launch VERIFIED: %s (pid %d) has %d window(s) in the framebuffer", req.name(), pid, mine)
+		return
+	}
+	if viaBus > 0 {
+		logf("launch VERIFIED via our private bus: %s (pid %d) exited, but %d window(s) "+
+			"belong to a service our own bus activated", req.name(), pid, viaBus)
+		return
+	}
+	logf("launch UNVERIFIED: %s (pid %d) put no window on screen in %v "+
+		"(%d window(s) on screen belong to other sessions). If this is a GUI "+
+		"application it may have been handed to an instance outside wlterm.",
+		req.name(), pid, launchVerifyAfter, others)
 }
 
 func cleanup(headless bool) {

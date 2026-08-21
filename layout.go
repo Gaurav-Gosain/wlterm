@@ -22,13 +22,13 @@ type window struct {
 	cell cellRect // content area in cells (the divider lives outside it)
 	area rect     // content area in pixels
 
-	imgID        uint32 // kitty image id for per-window transmission
-	sentW, sentH int    // last size we configured the client with
-	sentFocus    bool   // last activated state we configured
-	imgW, imgH   int    // size of the image the terminal currently holds
+	imgID        uint32    // kitty image id for per-window transmission
+	sentW, sentH int       // last size we configured the client with
+	sentFocus    bool      // last activated state we configured
+	imgW, imgH   int       // size of the image the terminal currently holds
 	dmg          damageSet // pending damage, canvas pixel coords
-	needsFull    bool   // retransmit the whole window image
-	placed       bool   // the terminal holds a placement for this window
+	needsFull    bool      // retransmit the whole window image
+	placed       bool      // the terminal holds a placement for this window
 }
 
 func (w *window) title() string {
@@ -332,6 +332,10 @@ func (comp *compositor) relayout() {
 		w.area = w.cell.px(cw, ch)
 	}
 	comp.chromeLayout = true
+	if comp.lc != nil && comp.lc.open {
+		// The panel is sized in cells, so a resize or a retile moves it.
+		comp.lc.change = lcAll
+	}
 	comp.configureAll()
 	for _, w := range wins {
 		if w.area.empty() {

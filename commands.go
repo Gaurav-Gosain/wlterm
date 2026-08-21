@@ -39,6 +39,21 @@ func prefixFromName(name string) (code uint32, mods uint32, ok bool) {
 //
 // Caller holds comp.mu. event: 1 press, 3 release.
 func (comp *compositor) handleKey(code, mods uint32, event int) bool {
+	// While the launcher is up it owns the keyboard outright. Every key,
+	// including every release, is consumed: a guest that saw only half of
+	// a press/release pair is a guest with a key stuck down, which is the
+	// bug that gave the first recursion demo 252 Enters.
+	if comp.lc != nil && comp.lc.open {
+		if event == 3 {
+			delete(comp.swallow, code)
+			return true
+		}
+		if event == 1 {
+			comp.arm(code)
+			comp.lc.key(code, mods)
+		}
+		return true
+	}
 	if comp.prefixCode == 0 {
 		return false
 	}
@@ -108,6 +123,19 @@ const (
 	kcUp    = 103
 	kcDown  = 108
 	kc1     = 2
+
+	// Launcher bindings and its editing keys.
+	kcD         = 32
+	kcSlash     = 53
+	kcU         = 22
+	kcW         = 17
+	kcEsc       = 1
+	kcEnter     = 28
+	kcBackspace = 14
+	kcPgUp      = 104
+	kcPgDn      = 109
+	kcHome      = 102
+	kcEnd       = 107
 )
 
 func (comp *compositor) runCommand(code, mods uint32) {
@@ -151,6 +179,8 @@ func (comp *compositor) runCommand(code, mods uint32) {
 		comp.focusDir(0, -1)
 	case kcJ, kcDown:
 		comp.focusDir(0, 1)
+	case kcD, kcSlash:
+		comp.openLauncher()
 	case kcQ:
 		comp.requestQuit()
 	default:
@@ -166,7 +196,7 @@ func (comp *compositor) runCommand(code, mods uint32) {
 
 func (comp *compositor) launch() {
 	if comp.spawn != nil && len(comp.spawnCmd) > 0 {
-		comp.spawn(comp.spawnCmd)
+		comp.spawn(spawnReq{argv: comp.spawnCmd, label: "spawn"})
 	}
 }
 

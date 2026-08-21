@@ -161,6 +161,12 @@ func (comp *compositor) setPointerFocus(s *wlSurface, lx, ly int) {
 func (comp *compositor) pointerMotion(x, y float64) {
 	ix, iy := int(x), int(y)
 	comp.seatState.lastPX, comp.seatState.lastPY = ix, iy
+	// The launcher is modal: while it is up, the pointer belongs to it and
+	// no guest sees motion under the panel.
+	if lc := comp.lc; lc != nil && lc.open {
+		lc.hover(ix, iy)
+		return
+	}
 	w := comp.windowAt(ix, iy)
 	s, lx, ly := comp.surfaceAt(w, ix, iy)
 	comp.setPointerFocus(s, lx, ly)
@@ -181,6 +187,10 @@ func (comp *compositor) pointerMotion(x, y float64) {
 
 func (comp *compositor) pointerButton(btn uint32, pressed bool) {
 	ix, iy := comp.seatState.lastPX, comp.seatState.lastPY
+	if lc := comp.lc; lc != nil && lc.open {
+		lc.click(btn, pressed, ix, iy)
+		return
+	}
 	// Click to focus: a press anywhere in a tile takes the keyboard, which
 	// is the behaviour a tiler needs when the pointer can wander over a
 	// divider and sit on nothing.
@@ -208,6 +218,16 @@ func (comp *compositor) pointerButton(btn uint32, pressed bool) {
 }
 
 func (comp *compositor) pointerAxis(vertical bool, value float64) {
+	if lc := comp.lc; lc != nil && lc.open {
+		if vertical {
+			if value > 0 {
+				lc.move(3)
+			} else {
+				lc.move(-3)
+			}
+		}
+		return
+	}
 	s := comp.pointerFocus
 	if s == nil {
 		return

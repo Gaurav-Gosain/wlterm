@@ -39,6 +39,8 @@ type renderStats struct {
 	shmBytes    atomic.Uint64
 	dmgPixels   atomic.Uint64
 	images      atomic.Uint64
+	overlayPx   atomic.Uint64
+	overlayOps  atomic.Uint64
 }
 
 var stats renderStats
@@ -53,6 +55,8 @@ type renderer struct {
 
 	rootSent  bool
 	rootDirty bool
+	blendLC   *launcher // single-canvas mode: overlay blended at emit time
+	layerSrc  *launcher // per-window mode: the image being emitted is a layer
 	rootDmg   rect
 	shmSeq    int
 	sub       []byte
@@ -151,10 +155,83 @@ func (r *renderer) frame() {
 	}
 	t1 := time.Now()
 
+	// The launcher overlay. It is planned here, under the lock, and written
+	// outside it like everything else.
+	//
+	// In per-window mode it is its own image at its own cell with z above
+	// the tiles, so opening it, typing in it and closing it never cost a
+	// tile a single byte. In single-canvas mode there is only one image, so
+	// it is blended into whatever rectangle is being transmitted; comp.frame
+	// itself is never touched either way, which is what makes closing the
+	// panel a repaint of pixels the canvas already holds rather than a
+	// recomposite of everything underneath.
+	var (
+		lcItem   emitItem
+		lcSend   bool
+		lcDelete bool
+		lcSrc    *launcher
+	)
+	r.blendLC = nil
+	if lc := comp.lc; lc != nil {
+		if lc.open {
+			if lc.change != lcNone || !lc.placed {
+				if !lc.placed {
+					lc.change = lcAll
+				}
+				d := lc.repaint()
+				lc.dmg = d
+			}
+			full := !lc.placed || r.mode != "delta" ||
+				lc.imgW != lc.pixW || lc.imgH != lc.pixH
+			if full {
+				lc.dmg.set(lc.area)
+			}
+			if !lc.dmg.empty() {
+				if r.layered {
+					lcItem = emitItem{
+						imgID: lc.imgID, area: lc.area, dmg: lc.dmg,
+						col: lc.cell.x + 1, row: lc.cell.y + 1, z: overlayZ, full: full,
+					}
+					lcSrc = lc
+					lcSend = true
+					lc.placed = true
+					lc.imgW, lc.imgH = lc.pixW, lc.pixH
+				} else {
+					for i := 0; i < lc.dmg.n; i++ {
+						r.rootDmg = r.rootDmg.union(lc.dmg.r[i])
+					}
+					r.rootDirty = true
+					lc.placed = true
+				}
+				lc.dmg.clear()
+			}
+			if !r.layered {
+				r.blendLC = lc
+			}
+		} else if lc.closing {
+			// Dismissal. In per-window mode this is one delete escape and
+			// zero pixels: the tiles under the panel were never overwritten,
+			// so the terminal already holds what is underneath.
+			lc.closing = false
+			lc.placed = false
+			lc.imgW, lc.imgH = 0, 0
+			if r.layered {
+				lcDelete = true
+			} else {
+				r.rootDmg = r.rootDmg.union(lc.area)
+				r.rootDirty = true
+			}
+		}
+	}
+
 	freed := comp.freeImages
 	comp.freeImages = nil
 	cbs := comp.pendingCB
 	comp.pendingCB = nil
+	if lcDelete {
+		freed = append(freed, comp.lc.imgID)
+		logf("overlay dismiss: one delete escape, 0 px, %d tiles touched", len(items))
+	}
 	rootDirty := r.rootDirty
 	rootDmg := r.rootDmg.clip(comp.frameW, comp.frameH)
 	r.rootDirty = false
@@ -162,7 +239,7 @@ func (r *renderer) frame() {
 	frameW, frameH := comp.frameW, comp.frameH
 	comp.mu.Unlock()
 
-	if !rootDirty && len(items) == 0 && len(freed) == 0 {
+	if !rootDirty && len(items) == 0 && len(freed) == 0 && !lcSend {
 		r.completeCallbacks(cbs)
 		return
 	}
@@ -182,6 +259,16 @@ func (r *renderer) frame() {
 		}
 		for _, it := range items {
 			shmBytes += r.emitImage(it.imgID, it.area, it.dmg, it.col, it.row, it.z, it.full)
+		}
+		if lcSend {
+			before := len(r.emitBuf)
+			n := r.emitLayer(lcSrc, lcItem)
+			shmBytes += n
+			stats.overlayPx.Add(uint64(lcItem.dmg.pixels()))
+			stats.overlayOps.Add(1)
+			logf("overlay %s: rects=%d px=%d shm_bytes=%d pty_bytes=%d tiles_touched=%d",
+				map[bool]string{true: "transmit", false: "patch"}[lcItem.full],
+				lcItem.dmg.n, lcItem.dmg.pixels(), n, len(r.emitBuf)-before, len(items))
 		}
 	} else {
 		// One canvas: union everything that moved and send that.
@@ -450,23 +537,50 @@ func (r *renderer) emitB64(pos string, kid uint32, w, h, z int) {
 }
 
 // extract copies a canvas rectangle into the scratch buffer as tight rows.
+// When a single-canvas overlay is active it is blended in afterwards, so the
+// overlay reaches the terminal without ever being written into comp.frame.
 func (r *renderer) extract(a rect) {
 	comp := r.comp
-	w := comp.frameW
+	if l := r.layerSrc; l != nil {
+		r.extractFrom(l.pix, l.pixW, l.area.x0, l.area.y0, a)
+		return
+	}
+	r.extractFrom(comp.frame, comp.frameW, 0, 0, a)
+	if r.blendLC != nil {
+		r.blendLC.blendInto(r.sub, a)
+	}
+}
+
+// extractFrom copies the canvas-space rectangle `a` out of a source buffer
+// whose pixel (0,0) sits at canvas (ox,oy) and whose stride is srcW.
+func (r *renderer) extractFrom(src []byte, srcW, ox, oy int, a rect) {
 	aw, ah := a.x1-a.x0, a.y1-a.y0
 	need := aw * ah * 4
 	if cap(r.sub) < need {
 		r.sub = make([]byte, need)
 	}
 	r.sub = r.sub[:need]
-	if aw == w {
-		copy(r.sub, comp.frame[a.y0*w*4:a.y1*w*4])
+	if aw == srcW && ox == 0 {
+		copy(r.sub, src[(a.y0-oy)*srcW*4:(a.y1-oy)*srcW*4])
 		return
 	}
 	for y := 0; y < ah; y++ {
-		so := ((a.y0+y)*w + a.x0) * 4
-		copy(r.sub[y*aw*4:(y+1)*aw*4], comp.frame[so:so+aw*4])
+		so := ((a.y0+y-oy)*srcW + (a.x0 - ox)) * 4
+		copy(r.sub[y*aw*4:(y+1)*aw*4], src[so:so+aw*4])
 	}
+}
+
+// overlayZ places the launcher above every tile. Tiles are placed at z=1 and
+// the chrome canvas at z=0, so the panel is the only thing in front of a
+// guest's pixels.
+const overlayZ = 5
+
+// emitLayer transmits an image whose pixels come from a layer buffer rather
+// than from the canvas. Same escapes, same shm ring, different source.
+func (r *renderer) emitLayer(lc *launcher, it emitItem) int {
+	r.layerSrc = lc
+	defer func() { r.layerSrc = nil }()
+	return r.emitImage(it.imgID, it.area, it.dmg, it.col, it.row, it.z, it.full)
 }
 
 // shmRingSize bounds tmpfs usage: at most this many frame files exist at
@@ -577,5 +691,8 @@ func statsLine(elapsed time.Duration) string {
 	fmt.Fprintf(&b, "fps=%.1f composite=%v encode=%v write=%v commit_to_out=%v ", float64(f)/secs, comp, enc, wr, lat)
 	fmt.Fprintf(&b, "pty_bytes_per_s=%d shm_bytes_per_s=%d ", int(float64(pty)/secs), int(float64(shm)/secs))
 	fmt.Fprintf(&b, "images_per_frame=%.2f dmg_px_per_frame=%d", float64(imgs)/float64(f), px/f)
+	if ops := stats.overlayOps.Swap(0); ops > 0 {
+		fmt.Fprintf(&b, " overlay_updates=%d overlay_px=%d", ops, stats.overlayPx.Swap(0))
+	}
 	return b.String()
 }
