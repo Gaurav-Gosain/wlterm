@@ -26,7 +26,7 @@ type window struct {
 	sentW, sentH int    // last size we configured the client with
 	sentFocus    bool   // last activated state we configured
 	imgW, imgH   int    // size of the image the terminal currently holds
-	dmg          rect   // pending damage, canvas pixel coords
+	dmg          damageSet // pending damage, canvas pixel coords
 	needsFull    bool   // retransmit the whole window image
 	placed       bool   // the terminal holds a placement for this window
 }
@@ -338,7 +338,7 @@ func (comp *compositor) relayout() {
 			continue
 		}
 		w.needsFull = true
-		w.dmg = w.area
+		w.dmg.set(w.area)
 	}
 	comp.markDirty()
 }

@@ -142,7 +142,7 @@ func (s *wlSurface) commit(c *client) {
 			dmg.y1 = w.area.y1
 		}
 		if !dmg.empty() {
-			w.dmg = w.dmg.union(dmg)
+			w.dmg.add(dmg)
 			comp.markDirty()
 		}
 	}

@@ -79,9 +79,9 @@ func (r *renderer) loop() {
 // outside it.
 type emitItem struct {
 	imgID    uint32
-	area     rect // canvas region the image covers
-	dmg      rect // canvas region that actually changed
-	col, row int  // cell position of the placement
+	area     rect      // canvas region the image covers
+	dmg      damageSet // the regions that actually changed
+	col, row int       // cell position of the placement
 	z        int
 	full     bool
 }
@@ -112,7 +112,7 @@ func (r *renderer) frame() {
 			for _, w := range comp.windows {
 				if !w.area.empty() {
 					w.needsFull = true
-					w.dmg = w.area
+					w.dmg.set(w.area)
 				}
 			}
 		}
@@ -126,22 +126,27 @@ func (r *renderer) frame() {
 		if w.dmg.empty() && !w.needsFull {
 			continue
 		}
-		dmg := w.dmg.union(rect{})
-		if w.needsFull || w.imgW != w.area.x1-w.area.x0 || w.imgH != w.area.y1-w.area.y0 {
-			dmg = w.area
-		}
-		dmg = dmg.clip(comp.frameW, comp.frameH)
-		r.compositeWindow(w, dmg)
 		full := w.needsFull || !r.layered ||
 			w.imgW != w.area.x1-w.area.x0 || w.imgH != w.area.y1-w.area.y0 ||
 			r.mode != "delta"
+		dmg := w.dmg
+		if full {
+			dmg.set(w.area)
+		}
+		dmg.clipTo(w.area.clip(comp.frameW, comp.frameH))
+		for i := 0; i < dmg.n; i++ {
+			r.compositeWindow(w, dmg.r[i])
+		}
 		items = append(items, emitItem{
 			imgID: w.imgID, area: w.area, dmg: dmg,
 			col: w.cell.x + 1, row: w.cell.y + 1, z: 1, full: full,
 		})
-		w.dmg = rect{}
+		w.dmg.clear()
 		w.needsFull = false
 		w.placed = r.layered
+		if r.layered {
+			w.imgW, w.imgH = w.area.x1-w.area.x0, w.area.y1-w.area.y0
+		}
 	}
 	t1 := time.Now()
 
@@ -169,7 +174,9 @@ func (r *renderer) frame() {
 	}
 	if r.layered {
 		if rootDirty {
-			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, rootDmg, 1, 1, 0,
+			var d damageSet
+			d.set(rootDmg)
+			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, d, 1, 1, 0,
 				r.mode != "delta" || !r.rootSent)
 		}
 		for _, it := range items {
@@ -177,15 +184,18 @@ func (r *renderer) frame() {
 		}
 	} else {
 		// One canvas: union everything that moved and send that.
-		dmg := rect{}
+		var dmg damageSet
 		if rootDirty {
-			dmg = rootDmg
+			dmg.add(rootDmg)
 		}
 		for _, it := range items {
-			dmg = dmg.union(it.dmg)
+			for i := 0; i < it.dmg.n; i++ {
+				dmg.add(it.dmg.r[i])
+			}
 		}
 		if !dmg.empty() {
-			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, dmg, 1, 1, 0, r.mode != "delta" || !r.rootSent)
+			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, dmg, 1, 1, 0,
+				r.mode != "delta" || !r.rootSent)
 		}
 	}
 	t3 := time.Now()
@@ -208,7 +218,7 @@ func (r *renderer) frame() {
 	stats.images.Add(uint64(len(items)))
 	px := 0
 	for _, it := range items {
-		px += (it.dmg.x1 - it.dmg.x0) * (it.dmg.y1 - it.dmg.y0)
+		px += it.dmg.pixels()
 	}
 	stats.dmgPixels.Add(uint64(px))
 
@@ -249,7 +259,7 @@ func (r *renderer) prepare() bool {
 		for _, win := range comp.windows {
 			win.imgW, win.imgH = 0, 0
 			win.needsFull = true
-			win.dmg = win.area
+			win.dmg.set(win.area)
 		}
 		return true
 	}
@@ -346,7 +356,7 @@ func blitBGRAtoRGBA(dst []byte, dw, dh int, src []byte, sw, sh, ox, oy int, blen
 // travelled through shared memory (zero for base64).
 //
 // imgID 0 means the chrome layer; it is transmitted as kitty image 1.
-func (r *renderer) emitImage(imgID uint32, area, dmg rect, col, row, z int, full bool) int {
+func (r *renderer) emitImage(imgID uint32, area rect, dmg damageSet, col, row, z int, full bool) int {
 	kid := imgID
 	if imgID == 0 {
 		kid = 1
@@ -357,22 +367,27 @@ func (r *renderer) emitImage(imgID uint32, area, dmg rect, col, row, z int, full
 	}
 
 	if r.mode == "delta" && !full {
-		// Animation-frame edit: patch the damage rect in place. Coordinates
-		// are relative to the image, so subtract the image origin.
-		dw, dh := dmg.x1-dmg.x0, dmg.y1-dmg.y0
-		if dw <= 0 || dh <= 0 {
-			return 0
+		// Animation-frame edits: patch each damaged rectangle in place.
+		// Coordinates are relative to the image, so subtract its origin.
+		sent := 0
+		for i := 0; i < dmg.n; i++ {
+			d := dmg.r[i]
+			dw, dh := d.x1-d.x0, d.y1-d.y0
+			if dw <= 0 || dh <= 0 {
+				continue
+			}
+			r.extract(d)
+			name := r.writeShm(r.sub)
+			if name == "" {
+				continue
+			}
+			r.emitBuf = append(r.emitBuf, fmt.Sprintf(
+				"\x1b_Ga=f,i=%d,r=1,X=1,x=%d,y=%d,s=%d,v=%d,f=32,t=s,q=2;%s\x1b\\",
+				kid, d.x0-area.x0, d.y0-area.y0, dw, dh,
+				base64.StdEncoding.EncodeToString([]byte(name)))...)
+			sent += len(r.sub)
 		}
-		r.extract(dmg)
-		name := r.writeShm(r.sub)
-		if name == "" {
-			return 0
-		}
-		r.emitBuf = append(r.emitBuf, fmt.Sprintf(
-			"\x1b_Ga=f,i=%d,r=1,X=1,x=%d,y=%d,s=%d,v=%d,f=32,t=s,q=2;%s\x1b\\",
-			kid, dmg.x0-area.x0, dmg.y0-area.y0, dw, dh,
-			base64.StdEncoding.EncodeToString([]byte(name)))...)
-		return len(r.sub)
+		return sent
 	}
 
 	r.extract(area)

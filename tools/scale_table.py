@@ -9,7 +9,10 @@ def dur(v, unit):
 
 rows = []
 for path in sorted(glob.glob(sys.argv[1] + "/*.log")):
-    load, layers, mode, n = os.path.basename(path)[:-4].rsplit("-", 3)
+    parts = os.path.basename(path)[:-4].split("-")
+    load, n = parts[0], parts[-1]
+    mode = parts[-2]
+    layers = "-".join(parts[1:-2])
     f = p = s = c = 0.0
     k = 0
     for line in open(path, errors="ignore"):
