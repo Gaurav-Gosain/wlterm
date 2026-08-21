@@ -58,6 +58,7 @@ func main() {
 	}
 
 	initPalette()
+	sweepOrphanShm()
 
 	comp := &compositor{
 		clients:     map[*client]bool{},
@@ -124,6 +125,7 @@ func main() {
 	if runtimeDir == "" {
 		runtimeDir = "/tmp"
 	}
+	sweepOrphanRuntime(runtimeDir)
 	childRuntime := runtimeDir
 	if *isolate {
 		childRuntime = fmt.Sprintf("%s/wlterm-rt-%d", runtimeDir, os.Getpid())

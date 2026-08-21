@@ -15,7 +15,7 @@ pfx(){ k 98 5; }
 type_str(){ local s="$1"; local i c; for ((i=0;i<${#s};i++)); do c="${s:$i:1}"; k "$(printf '%d' "'$c")" 1; sleep 0.03; done; }
 
 {
-  sleep 6                       # let the first three clients map
+  sleep 9                       # let the clients map
   pfx; k 9 1;   sleep 1         # focus next
   type_str "echo hello from tile two"; k 13 1; sleep 2
   pfx; k 9 1;   sleep 1
@@ -31,7 +31,7 @@ type_str(){ local s="$1"; local i c; for ((i=0;i<${#s};i++)); do c="${s:$i:1}"; 
      -spawn "foot -T shell sh -c 'exec sh'" \
      -exec "foot -T foot-one sh -c 'echo a real terminal; exec sh'" \
      -exec "foot -T foot-two sh -c 'echo another one; exec sh'" \
-     -exec "evince /tmp/wlterm-demo.pdf" \
+     -exec "thunar /usr/share/fonts" \
      -exec "sleep 2; kitty -o confirm_os_window_close=0 -e sh -c 'echo kitty on llvmpipe; exec sh'" \
      >/dev/null 2>&1
 

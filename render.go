@@ -25,6 +25,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -474,7 +475,16 @@ func (r *renderer) extract(a rect) {
 // version's, or a frame can lap itself.
 const shmRingSize = 32
 
+// shuttingDown stops the renderer creating new ring slots once teardown has
+// begun. Without it the render goroutine can write a fresh frame in the gap
+// between cleanupShm() and process exit, and leave it behind: every stray
+// file found on this machine came from exactly that race.
+var shuttingDown atomic.Bool
+
 func (r *renderer) writeShm(pixels []byte) string {
+	if shuttingDown.Load() {
+		return ""
+	}
 	r.shmSeq++
 	name := fmt.Sprintf("/wlterm-%d-%d", os.Getpid(), r.shmSeq%shmRingSize)
 	os.Remove("/dev/shm" + name)
@@ -494,8 +504,58 @@ func (r *renderer) writeShm(pixels []byte) string {
 }
 
 func cleanupShm() {
+	shuttingDown.Store(true)
 	for i := 0; i < shmRingSize; i++ {
 		os.Remove(fmt.Sprintf("/dev/shm/wlterm-%d-%d", os.Getpid(), i))
+	}
+}
+
+// sweepOrphanShm removes ring slots left by earlier wlterm processes that no
+// longer exist. Only files matching our own naming are touched, and only
+// when their owning pid is gone.
+func sweepOrphanShm() {
+	ents, err := os.ReadDir("/dev/shm")
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		var pid, slot int
+		if n, _ := fmt.Sscanf(e.Name(), "wlterm-%d-%d", &pid, &slot); n != 2 {
+			continue
+		}
+		if pid == os.Getpid() {
+			continue
+		}
+		if err := syscall.Kill(pid, 0); err == nil || err == syscall.EPERM {
+			continue // still running
+		}
+		os.Remove("/dev/shm/" + e.Name())
+		logf("swept orphaned shm slot from pid %d", pid)
+	}
+}
+
+// sweepOrphanRuntime removes private runtime directories left by wlterm
+// processes that are gone. A client's own helper daemons can recreate the
+// directory microseconds after teardown removed it, so the reliable time to
+// collect them is at the next start.
+func sweepOrphanRuntime(base string) {
+	ents, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		var pid int
+		if n, _ := fmt.Sscanf(e.Name(), "wlterm-rt-%d", &pid); n != 1 {
+			continue
+		}
+		if pid == os.Getpid() {
+			continue
+		}
+		if err := syscall.Kill(pid, 0); err == nil || err == syscall.EPERM {
+			continue
+		}
+		os.RemoveAll(base + "/" + e.Name())
+		logf("swept orphaned runtime dir from pid %d", pid)
 	}
 }
 
