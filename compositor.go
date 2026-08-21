@@ -30,10 +30,39 @@ type compositor struct {
 	cellW, cellH      int
 
 	serial    uint32
-	toplevel  *xdgToplevel // the single fullscreen toplevel we show
 	clients   map[*client]bool
 	seatState seatState
-	focusSent bool
+
+	// Tiling state. windows is creation order (master-stack reads it as
+	// master-first); root is the BSP tree over the same set.
+	windows     []*window
+	root        *node
+	focus       *window
+	zoomed      *window
+	mode        layoutMode
+	masterRatio float64
+	nextSplit   splitDir
+	nextImgID   uint32
+	region      cellRect
+	popups      []*xdgPopup
+
+	// Seat focus is explicit now that there is more than one surface.
+	kbFocus      *wlSurface
+	pointerFocus *wlSurface
+
+	// Compositor keybindings: a tuios-style prefix, then a command key.
+	prefixArmed bool
+	prefixName  string
+	prefixCode  uint32
+	prefixMods  uint32
+	swallow     map[uint32]bool
+	spawnCmd    []string
+	spawn       func([]string)
+	quitFn      func()
+	freeImages  []uint32 // image ids whose placements must be deleted
+
+	chromeDirty bool
+	pendingCB   []frameCB
 
 	// frame is the composited output canvas (RGBA).
 	frame       []byte
@@ -46,6 +75,13 @@ type compositor struct {
 	keymapOnce  sync.Once
 	commitCount uint64
 	commitBytes uint64
+}
+
+// frameCB is a wl_callback owed to a client once the frame it committed
+// into has actually been written to the terminal.
+type frameCB struct {
+	c  *client
+	id uint32
 }
 
 type rect struct{ x0, y0, x1, y1 int }
@@ -93,12 +129,39 @@ func (comp *compositor) nextSerial() uint32 {
 	return comp.serial
 }
 
+func (comp *compositor) markDirty() {
+	if !comp.dirty {
+		comp.dirtyAt = time.Now()
+	}
+	comp.dirty = true
+	select {
+	case comp.renderCh <- struct{}{}:
+	default:
+	}
+}
+
+// clientGone drops every window a disconnected client owned. One client can
+// own several toplevels, and several clients can be connected at once, so
+// this is a sweep rather than a single check.
 func (comp *compositor) clientGone(c *client) {
 	delete(comp.clients, c)
-	if comp.toplevel != nil && comp.toplevel.surf != nil && comp.toplevel.client == c {
-		comp.toplevel = nil
-		comp.focusSent = false
+	comp.seatState.dropClient(c)
+	var doomed []*window
+	for _, w := range comp.windows {
+		if w.top != nil && w.top.client == c {
+			doomed = append(doomed, w)
+		}
 	}
+	for _, w := range doomed {
+		comp.removeWindow(w)
+	}
+	if comp.pointerFocus != nil && comp.pointerFocus.client == c {
+		comp.pointerFocus = nil
+	}
+	if comp.kbFocus != nil && comp.kbFocus.client == c {
+		comp.kbFocus = nil
+	}
+	logf("client gone: %d windows left", len(comp.windows))
 }
 
 // ---- wl_display (object 1) ----

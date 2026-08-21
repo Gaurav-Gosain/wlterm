@@ -272,6 +272,14 @@ func (p *inputParser) dispatchKey(code uint32, kittyMods uint32, event int) {
 func (p *inputParser) dispatchKeyEx(code uint32, kittyMods uint32, event int, trustRelease bool) {
 	comp := p.comp
 	comp.mu.Lock()
+	defer comp.mu.Unlock()
+	// Compositor bindings get first refusal on every key.
+	if comp.handleKey(code, kittyMods, event) {
+		if !trustRelease && event == 1 {
+			delete(comp.swallow, code) // no release will arrive to swallow
+		}
+		return
+	}
 	comp.setModifiers(kittyModsToXkb(kittyMods))
 	switch event {
 	case 1:
@@ -283,7 +291,6 @@ func (p *inputParser) dispatchKeyEx(code uint32, kittyMods uint32, event int, tr
 		comp.key(code, false)
 	}
 	// event 2 (repeat): dropped, client repeats via repeat_info
-	comp.mu.Unlock()
 }
 
 func (p *inputParser) tap(code uint32, mods uint32) {
@@ -331,11 +338,15 @@ func (p *inputParser) tapLegacy(code uint32, kittyMods uint32) {
 	}
 	comp := p.comp
 	comp.mu.Lock()
+	defer comp.mu.Unlock()
+	if comp.handleKey(code, kittyMods, 1) {
+		delete(comp.swallow, code)
+		return
+	}
 	comp.setModifiers(kittyModsToXkb(kittyMods))
 	comp.key(code, true)
 	comp.key(code, false)
 	comp.setModifiers(0)
-	comp.mu.Unlock()
 }
 
 // sgrMouse handles "b;x;y" with press flag.

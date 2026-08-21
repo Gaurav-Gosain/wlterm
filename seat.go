@@ -29,10 +29,11 @@ func (s *wlSeat) handle(c *client, id uint32, opcode uint16, r *argReader) {
 			c.event(kid, 0, uint32(1), fdArg(km.fd), uint32(km.size)) // keymap xkb_v1
 		}
 		c.event(kid, 5, int32(30), int32(400)) // repeat_info: rate 30, delay 400ms
-		// If the toplevel is already up, focus it now.
-		if t := c.comp.toplevel; t != nil && t.client == c && c.comp.focusSent {
-			c.event(kid, 1, c.comp.nextSerial(), t.surf.id, []byte{}) // enter
-			c.comp.sendModifiers()
+		// If this client already owns the focused surface, hand it focus
+		// now: a client may bind the keyboard after its window was mapped.
+		if f := c.comp.kbFocus; f != nil && f.client == c {
+			c.event(kid, 1, c.comp.nextSerial(), f.id, []byte{})
+			c.event(kid, 4, c.comp.nextSerial(), c.comp.seatState.mods, uint32(0), uint32(0), uint32(0))
 		}
 	case 2: // get_touch
 		c.objects[r.uint()] = wlTouch{}
@@ -49,10 +50,11 @@ type seatRes struct {
 type seatState struct {
 	pointers  []seatRes
 	keyboards []seatRes
-	ptrIn     bool // pointer has entered the surface
 	mods      uint32
 	lastX     wlFixed
 	lastY     wlFixed
+	lastPX    int // last pointer position in canvas pixels
+	lastPY    int
 }
 
 type wlPointer struct{}
@@ -94,6 +96,24 @@ func (ss *seatState) dropPointer(c *client, id uint32) {
 		}
 	}
 }
+// dropClient forgets every seat resource a disconnected client held.
+func (ss *seatState) dropClient(c *client) {
+	ps := ss.pointers[:0]
+	for _, p := range ss.pointers {
+		if p.c != c {
+			ps = append(ps, p)
+		}
+	}
+	ss.pointers = ps
+	ks := ss.keyboards[:0]
+	for _, k := range ss.keyboards {
+		if k.c != c {
+			ks = append(ks, k)
+		}
+	}
+	ss.keyboards = ks
+}
+
 func (ss *seatState) dropKeyboard(c *client, id uint32) {
 	for i, k := range ss.keyboards {
 		if k.c == c && k.id == id {
@@ -143,132 +163,3 @@ func memfdCreate(name string) (int, error) {
 
 func nowMs() uint32 { return uint32(time.Now().UnixNano() / 1e6) }
 
-// ---- event fan-out, called with comp.mu held ----
-
-func (comp *compositor) focusedSurface() *wlSurface {
-	if comp.toplevel != nil {
-		return comp.toplevel.surf
-	}
-	return nil
-}
-
-func (comp *compositor) pointerMotion(x, y float64) {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	ss := &comp.seatState
-	fx, fy := fixed(x), fixed(y)
-	ss.lastX, ss.lastY = fx, fy
-	for _, p := range ss.pointers {
-		if p.c != surf.client {
-			continue
-		}
-		if !ss.ptrIn {
-			p.c.event(p.id, 0, comp.nextSerial(), surf.id, fx, fy) // enter
-		}
-		p.c.event(p.id, 2, nowMs(), fx, fy) // motion
-		p.c.event(p.id, 5)                  // frame
-		p.c.flush()
-	}
-	ss.ptrIn = true
-}
-
-func (comp *compositor) pointerButton(btn uint32, pressed bool) {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	ss := &comp.seatState
-	state := uint32(0)
-	if pressed {
-		state = 1
-	}
-	for _, p := range ss.pointers {
-		if p.c != surf.client {
-			continue
-		}
-		if !ss.ptrIn {
-			p.c.event(p.id, 0, comp.nextSerial(), surf.id, ss.lastX, ss.lastY)
-			ss.ptrIn = true
-		}
-		p.c.event(p.id, 3, comp.nextSerial(), nowMs(), btn, state) // button
-		p.c.event(p.id, 5)                                         // frame
-		p.c.flush()
-	}
-}
-
-func (comp *compositor) pointerAxis(vertical bool, value float64) {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	axis := uint32(0) // vertical
-	if !vertical {
-		axis = 1
-	}
-	for _, p := range comp.seatState.pointers {
-		if p.c != surf.client {
-			continue
-		}
-		p.c.event(p.id, 4, nowMs(), axis, fixed(value)) // axis
-		p.c.event(p.id, 5)                              // frame
-		p.c.flush()
-	}
-}
-
-func (comp *compositor) key(code uint32, pressed bool) {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	state := uint32(0)
-	if pressed {
-		state = 1
-	}
-	for _, k := range comp.seatState.keyboards {
-		if k.c != surf.client {
-			continue
-		}
-		k.c.event(k.id, 3, comp.nextSerial(), nowMs(), code, state) // key
-		k.c.flush()
-	}
-}
-
-// setModifiers takes an xkb mod mask (shift=1, ctrl=4, mod1=8, mod4=64).
-func (comp *compositor) setModifiers(mask uint32) {
-	if comp.seatState.mods == mask {
-		return
-	}
-	comp.seatState.mods = mask
-	comp.sendModifiers()
-}
-
-func (comp *compositor) sendModifiers() {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	for _, k := range comp.seatState.keyboards {
-		if k.c != surf.client {
-			continue
-		}
-		k.c.event(k.id, 4, comp.nextSerial(), comp.seatState.mods, uint32(0), uint32(0), uint32(0))
-		k.c.flush()
-	}
-}
-
-// keyboardEnter is sent once the toplevel's first buffer lands.
-func (comp *compositor) keyboardEnter() {
-	surf := comp.focusedSurface()
-	if surf == nil {
-		return
-	}
-	for _, k := range comp.seatState.keyboards {
-		if k.c != surf.client {
-			continue
-		}
-		k.c.event(k.id, 1, comp.nextSerial(), surf.id, []byte{})
-		k.c.flush()
-	}
-}

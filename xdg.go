@@ -6,7 +6,6 @@ package main
 import (
 	"encoding/binary"
 	"runtime/debug"
-	"time"
 )
 
 // ---- wl_surface ----
@@ -28,16 +27,17 @@ type wlSurface struct {
 	role     *xdgSurface
 	sub      *wlSubsurface
 	children []*wlSubsurface
+	mapped   bool
 }
 
 func (s *wlSurface) iface() string { return "wl_surface" }
 func (s *wlSurface) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	switch opcode {
 	case 0: // destroy
-		if c.comp.toplevel != nil && c.comp.toplevel.surf == s {
-			c.comp.toplevel = nil
-			c.comp.focusSent = false
+		if s.role != nil && s.role.toplevel != nil && s.role.toplevel.win != nil {
+			c.comp.removeWindow(s.role.toplevel.win)
 		}
+		c.comp.surfaceGone(s)
 		c.deleteID(id)
 	case 1: // attach(buffer, x, y)
 		bufID := r.uint()
@@ -87,46 +87,117 @@ func (s *wlSurface) commit(c *client) {
 		s.pendingBufSet = false
 	}
 
-	// First commit on an xdg surface with no buffer -> send initial configure.
+	// First commit on an xdg surface: the client is asking to be told how
+	// big it may be. With several tiles on screen this is where each client
+	// learns its own rectangle rather than the whole pane.
 	if s.role != nil && !s.role.configured {
 		s.role.sendConfigure(c, comp)
 		s.role.configured = true
 	}
 
-	if s.content != nil && (comp.toplevel == nil || comp.toplevel.surf == s || isChildOf(s, comp.toplevel.surf)) {
+	// Frame callbacks are owed once this frame reaches the terminal, which
+	// is what paces a client against the pty rather than against a clock.
+	if len(s.frameCallbacks) > 0 {
+		for _, id := range s.frameCallbacks {
+			comp.pendingCB = append(comp.pendingCB, frameCB{c, id})
+		}
+		s.frameCallbacks = nil
+		comp.markDirty()
+	}
+
+	w := comp.windowForSurface(s)
+	if w == nil || w.area.empty() {
+		s.pendingDamage = rect{}
+		return
+	}
+	if s.content != nil {
+		if !s.mapped {
+			s.mapped = true
+			if comp.focus == w {
+				comp.setKeyboardFocus(s)
+			}
+		}
 		dmg := s.pendingDamage
 		if dmg.empty() {
 			dmg = rect{0, 0, s.w, s.h}
 		}
 		off := offsetOf(s)
-		dmg.x0 += off.x
-		dmg.x1 += off.x
-		dmg.y0 += off.y
-		dmg.y1 += off.y
-		comp.damage = comp.damage.union(dmg.clip(comp.widthPx, comp.heightPx))
-		if !comp.dirty {
-			comp.dirtyAt = time.Now()
+		dmg.x0 += off.x + w.area.x0
+		dmg.x1 += off.x + w.area.x0
+		dmg.y0 += off.y + w.area.y0
+		dmg.y1 += off.y + w.area.y0
+		dmg = dmg.clip(comp.widthPx, comp.heightPx)
+		if dmg.x0 < w.area.x0 {
+			dmg.x0 = w.area.x0
 		}
-		comp.dirty = true
-		if !comp.focusSent && comp.toplevel != nil && comp.toplevel.surf == s {
-			comp.focusSent = true
-			comp.keyboardEnter()
-			comp.sendModifiers()
+		if dmg.y0 < w.area.y0 {
+			dmg.y0 = w.area.y0
 		}
-		select {
-		case comp.renderCh <- struct{}{}:
-		default:
+		if dmg.x1 > w.area.x1 {
+			dmg.x1 = w.area.x1
+		}
+		if dmg.y1 > w.area.y1 {
+			dmg.y1 = w.area.y1
+		}
+		if !dmg.empty() {
+			w.dmg = w.dmg.union(dmg)
+			comp.markDirty()
 		}
 	}
 	s.pendingDamage = rect{}
 }
 
+// windowForSurface walks up subsurface parents until it reaches a surface
+// with a toplevel role, and returns that toplevel's tile.
+func (comp *compositor) windowForSurface(s *wlSurface) *window {
+	cur := s
+	for i := 0; i < 16; i++ {
+		if cur.role != nil && cur.role.toplevel != nil {
+			return cur.role.toplevel.win
+		}
+		if cur.role != nil && cur.role.popup != nil && cur.role.popup.parent != nil {
+			cur = cur.role.popup.parent
+			continue
+		}
+		if cur.sub != nil && cur.sub.parent != nil {
+			cur = cur.sub.parent
+			continue
+		}
+		return nil
+	}
+	return nil
+}
+
+// surfaceGone clears any seat focus pointing at a destroyed surface.
+func (comp *compositor) surfaceGone(s *wlSurface) {
+	if comp.pointerFocus == s {
+		comp.pointerFocus = nil
+	}
+	if comp.kbFocus == s {
+		comp.kbFocus = nil
+	}
+	for i, p := range comp.popups {
+		if p.xdg != nil && p.xdg.surf == s {
+			comp.popups = append(comp.popups[:i], comp.popups[i+1:]...)
+			comp.chromeDirty = true
+			comp.markDirty()
+			break
+		}
+	}
+}
+
 type point struct{ x, y int }
 
+// offsetOf is a surface's position relative to its toplevel's content
+// origin, accumulated through subsurface and popup parents.
 func offsetOf(s *wlSurface) point {
 	if s.sub != nil && s.sub.parent != nil {
 		p := offsetOf(s.sub.parent)
 		return point{p.x + s.sub.x, p.y + s.sub.y}
+	}
+	if s.role != nil && s.role.popup != nil && s.role.popup.parent != nil {
+		p := offsetOf(s.role.popup.parent)
+		return point{p.x + s.role.popup.x, p.y + s.role.popup.y}
 	}
 	return point{}
 }
@@ -191,7 +262,7 @@ func (x *xdgWmBase) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	case 0: // destroy
 		c.deleteID(id)
 	case 1: // create_positioner
-		c.objects[r.uint()] = xdgPositioner{}
+		c.objects[r.uint()] = &xdgPositioner{}
 	case 2: // get_xdg_surface(new_id, surface)
 		xid := r.uint()
 		surfID := r.uint()
@@ -206,12 +277,28 @@ func (x *xdgWmBase) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	}
 }
 
-type xdgPositioner struct{}
+// xdgPositioner records just enough of the placement request to put a menu
+// roughly where the client asked. No constraint solving.
+type xdgPositioner struct {
+	w, h       int
+	ax, ay     int
+	offX, offY int
+}
 
-func (xdgPositioner) iface() string { return "xdg_positioner" }
-func (xdgPositioner) handle(c *client, id uint32, opcode uint16, r *argReader) {
-	if opcode == 0 {
+func (p *xdgPositioner) iface() string { return "xdg_positioner" }
+func (p *xdgPositioner) handle(c *client, id uint32, opcode uint16, r *argReader) {
+	switch opcode {
+	case 0: // destroy
 		c.deleteID(id)
+	case 1: // set_size(w, h)
+		p.w, p.h = int(r.int()), int(r.int())
+	case 2: // set_anchor_rect(x, y, w, h)
+		p.ax, p.ay = int(r.int()), int(r.int())
+		aw, ah := int(r.int()), int(r.int())
+		_ = aw
+		p.ay += ah // anchor below the rect: the common menu case
+	case 5: // set_offset(x, y)
+		p.offX, p.offY = int(r.int()), int(r.int())
 	}
 }
 
@@ -221,6 +308,7 @@ type xdgSurface struct {
 	id         uint32
 	surf       *wlSurface
 	toplevel   *xdgToplevel
+	popup      *xdgPopup
 	configured bool
 }
 
@@ -237,28 +325,102 @@ func (x *xdgSurface) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		t := &xdgToplevel{id: tid, xdg: x, surf: x.surf, client: c}
 		x.toplevel = t
 		c.objects[tid] = t
-		if c.comp.toplevel == nil {
-			c.comp.toplevel = t
-		}
+		c.comp.addWindow(t)
 	case 2: // get_popup(new_id, parent, positioner)
 		pid := r.uint()
-		c.objects[pid] = &xdgPopup{id: pid, xdg: x}
-		logf("popup created (rendered nowhere yet)")
+		parentID := r.uint()
+		posID := r.uint()
+		p := &xdgPopup{id: pid, xdg: x}
+		if ps, ok := c.get(parentID).(*xdgSurface); ok {
+			p.parent = ps.surf
+		}
+		if pos, ok := c.get(posID).(*xdgPositioner); ok {
+			p.w, p.h = pos.w, pos.h
+			// Minimal placement: anchor rect origin plus the requested
+			// offset. No constraint adjustment; a menu near an edge may
+			// overhang and get clipped to the tile.
+			p.x = pos.ax + pos.offX
+			p.y = pos.ay + pos.offY
+			if p.w <= 0 {
+				p.w, p.h = 1, 1
+			}
+		}
+		x.popup = p
+		c.objects[pid] = p
+		c.comp.popups = append(c.comp.popups, p)
 	case 3: // set_window_geometry
 	case 4: // ack_configure(serial)
 		r.uint()
 	}
 }
 
+// sendConfigure tells one client the size of its own tile. This is the
+// difference between "every app thinks it owns the screen" and a tiler:
+// each toplevel gets its rectangle, and re-gets it whenever the tiling
+// changes underneath it.
 func (x *xdgSurface) sendConfigure(c *client, comp *compositor) {
-	if x.toplevel != nil {
-		// states: maximized(1) + activated(4)
-		states := make([]byte, 8)
-		binary.LittleEndian.PutUint32(states, 1)
-		binary.LittleEndian.PutUint32(states[4:], 4)
-		c.event(x.toplevel.id, 0, int32(comp.widthPx), int32(comp.heightPx), states)
+	if t := x.toplevel; t != nil {
+		w, h := comp.widthPx, comp.heightPx
+		if t.win != nil && !t.win.area.empty() {
+			w = t.win.area.x1 - t.win.area.x0
+			h = t.win.area.y1 - t.win.area.y0
+		}
+		c.event(t.id, 0, int32(w), int32(h), toplevelStates(comp, t))
+		if t.win != nil {
+			t.win.sentW, t.win.sentH = w, h
+			t.win.sentFocus = comp.focus == t.win
+		}
+	}
+	if p := x.popup; p != nil {
+		c.event(p.id, 0, int32(p.x), int32(p.y), int32(p.w), int32(p.h))
 	}
 	c.event(x.id, 0, comp.nextSerial()) // xdg_surface.configure
+}
+
+// toplevelStates: maximized so clients drop their own decorations, plus
+// activated only on the focused tile, plus the tiled_* states so clients
+// that understand them square off their corners.
+func toplevelStates(comp *compositor, t *xdgToplevel) []byte {
+	states := []uint32{1} // maximized
+	if t.win != nil && comp.focus == t.win {
+		states = append(states, 4) // activated
+	}
+	states = append(states, 5, 6, 7, 8) // tiled left/right/top/bottom
+	buf := make([]byte, 4*len(states))
+	for i, v := range states {
+		binary.LittleEndian.PutUint32(buf[i*4:], v)
+	}
+	return buf
+}
+
+// configureAll re-sends a configure to every tile whose rectangle or focus
+// state changed. Called after any relayout.
+func (comp *compositor) configureAll() {
+	touched := map[*client]bool{}
+	for _, w := range comp.windows {
+		t := w.top
+		if t == nil || t.xdg == nil || !t.xdg.configured {
+			continue
+		}
+		nw, nh := 0, 0
+		if !w.area.empty() {
+			nw, nh = w.area.x1-w.area.x0, w.area.y1-w.area.y0
+		}
+		focused := comp.focus == w
+		if nw == w.sentW && nh == w.sentH && focused == w.sentFocus {
+			continue
+		}
+		if nw == 0 || nh == 0 {
+			continue
+		}
+		w.sentW, w.sentH, w.sentFocus = nw, nh, focused
+		t.client.event(t.id, 0, int32(nw), int32(nh), toplevelStates(comp, t))
+		t.client.event(t.xdg.id, 0, comp.nextSerial())
+		touched[t.client] = true
+	}
+	for c := range touched {
+		c.flush()
+	}
 }
 
 // ---- xdg_toplevel ----
@@ -268,48 +430,79 @@ type xdgToplevel struct {
 	xdg    *xdgSurface
 	surf   *wlSurface
 	client *client
+	win    *window
 	title  string
+	appID  string
 }
 
 func (t *xdgToplevel) iface() string { return "xdg_toplevel" }
 func (t *xdgToplevel) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	switch opcode {
 	case 0: // destroy
-		if c.comp.toplevel == t {
-			c.comp.toplevel = nil
-			c.comp.focusSent = false
-		}
+		c.comp.removeWindow(t.win)
 		c.deleteID(id)
 	case 2: // set_title
 		t.title = r.string()
-		logf("toplevel title: %q", t.title)
+		if t.win != nil {
+			c.comp.chromeDirty = true
+			c.comp.markDirty()
+		}
 	case 3: // set_app_id
-		logf("toplevel app_id: %q", r.string())
+		t.appID = r.string()
+		if t.win != nil && t.title == "" {
+			c.comp.chromeDirty = true
+			c.comp.markDirty()
+		}
+	case 11: // set_fullscreen -> the tile is the world; zoom instead
+		if t.win != nil {
+			c.comp.zoomed = t.win
+			c.comp.relayout()
+		}
+	case 12: // unset_fullscreen
+		if c.comp.zoomed == t.win {
+			c.comp.zoomed = nil
+			c.comp.relayout()
+		}
 	}
-	// move/resize/min/max/fullscreen requests ignored: pane is the world.
+	// move/resize/minimise requests ignored: the tiler owns geometry.
 }
 
-// resize tells the client the pane changed size.
-func (t *xdgToplevel) resize(comp *compositor) {
-	c := t.client
-	states := make([]byte, 8)
-	binary.LittleEndian.PutUint32(states, 1)
-	binary.LittleEndian.PutUint32(states[4:], 4)
-	c.event(t.id, 0, int32(comp.widthPx), int32(comp.heightPx), states)
-	c.event(t.xdg.id, 0, comp.nextSerial())
-	c.flush()
+// close asks the client to shut this toplevel down, the polite way a tiling
+// WM closes a window.
+func (t *xdgToplevel) close() {
+	t.client.event(t.id, 1) // xdg_toplevel.close
+	t.client.flush()
 }
 
-// ---- xdg_popup (accepted, never shown) ----
+// ---- xdg_popup ----
 
 type xdgPopup struct {
-	id  uint32
-	xdg *xdgSurface
+	id      uint32
+	xdg     *xdgSurface
+	parent  *wlSurface
+	x, y    int
+	w, h    int
+	grabbed bool
 }
 
 func (p *xdgPopup) iface() string { return "xdg_popup" }
 func (p *xdgPopup) handle(c *client, id uint32, opcode uint16, r *argReader) {
-	if opcode == 0 {
+	switch opcode {
+	case 0: // destroy
+		c.comp.dropPopup(p)
 		c.deleteID(id)
+	case 1: // grab(seat, serial)
+		p.grabbed = true
+	}
+}
+
+func (comp *compositor) dropPopup(p *xdgPopup) {
+	for i, x := range comp.popups {
+		if x == p {
+			comp.popups = append(comp.popups[:i], comp.popups[i+1:]...)
+			comp.chromeDirty = true
+			comp.markDirty()
+			return
+		}
 	}
 }
