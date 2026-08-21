@@ -53,6 +53,14 @@ type client struct {
 	wbuf    []byte
 	pendFds []int
 	dead    bool
+
+	// pid and sid come from SO_PEERCRED at accept time. They are what lets
+	// a launch be verified against the framebuffer rather than against an
+	// exit code: a window whose client shares the session of the process we
+	// started is ours, and a window that appeared from anywhere else is
+	// evidence the launch escaped.
+	pid int
+	sid int
 }
 
 type object interface {
