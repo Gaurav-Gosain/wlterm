@@ -52,6 +52,7 @@ type renderer struct {
 
 	rootSent  bool
 	rootDirty bool
+	rootDmg   rect
 	shmSeq    int
 	sub       []byte
 	b64buf    []byte
@@ -97,14 +98,24 @@ func (r *renderer) frame() {
 
 	t0 := time.Now()
 	if r.prepare() {
-		comp.chromeDirty = true
+		comp.chromeLayout = true
 	}
-	if comp.chromeDirty {
-		comp.chromeDirty = false
-		r.drawChrome()
+	if comp.chromeLayout || comp.chromeDirty {
+		full := comp.chromeLayout
+		comp.chromeLayout, comp.chromeDirty = false, false
+		r.rootDmg = r.rootDmg.union(r.drawChrome(full))
 		r.rootDirty = true
-		// Chrome never writes inside a live tile, so guest pixels survive a
-		// chrome repaint and no tile needs recompositing here.
+		if full {
+			// The ground was repainted under every tile, so every tile owes
+			// a recomposite. This is the expensive path, and it only runs
+			// when the tiling itself changed.
+			for _, w := range comp.windows {
+				if !w.area.empty() {
+					w.needsFull = true
+					w.dmg = w.area
+				}
+			}
+		}
 	}
 
 	var items []emitItem
@@ -139,7 +150,9 @@ func (r *renderer) frame() {
 	cbs := comp.pendingCB
 	comp.pendingCB = nil
 	rootDirty := r.rootDirty
+	rootDmg := r.rootDmg.clip(comp.frameW, comp.frameH)
 	r.rootDirty = false
+	r.rootDmg = rect{}
 	frameW, frameH := comp.frameW, comp.frameH
 	comp.mu.Unlock()
 
@@ -156,7 +169,8 @@ func (r *renderer) frame() {
 	}
 	if r.layered {
 		if rootDirty {
-			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, rect{0, 0, frameW, frameH}, 1, 1, 0, true)
+			shmBytes += r.emitImage(0, rect{0, 0, frameW, frameH}, rootDmg, 1, 1, 0,
+				r.mode != "delta" || !r.rootSent)
 		}
 		for _, it := range items {
 			shmBytes += r.emitImage(it.imgID, it.area, it.dmg, it.col, it.row, it.z, it.full)
@@ -165,7 +179,7 @@ func (r *renderer) frame() {
 		// One canvas: union everything that moved and send that.
 		dmg := rect{}
 		if rootDirty {
-			dmg = rect{0, 0, frameW, frameH}
+			dmg = rootDmg
 		}
 		for _, it := range items {
 			dmg = dmg.union(it.dmg)

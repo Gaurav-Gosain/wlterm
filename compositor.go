@@ -61,8 +61,13 @@ type compositor struct {
 	quitFn      func()
 	freeImages  []uint32 // image ids whose placements must be deleted
 
-	chromeDirty bool
-	pendingCB   []frameCB
+	// Two levels of chrome repaint. A layout change repaints the whole
+	// canvas and costs every tile a recomposite; a focus or title change
+	// only touches the rules, which live outside every content rectangle,
+	// so guest pixels and guest transmissions are left alone.
+	chromeLayout bool
+	chromeDirty  bool
+	pendingCB    []frameCB
 
 	// frame is the composited output canvas (RGBA).
 	frame       []byte

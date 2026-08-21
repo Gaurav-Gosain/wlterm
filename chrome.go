@@ -378,26 +378,49 @@ func (r *renderer) drawWindowRule(w *window, focused bool) {
 		}
 	}
 
-	// The title badge sits inline in the bottom rule, centred, and the rule
-	// is left out underneath it.
-	skip := rect{}
-	title := w.title()
-	atlas := pickAtlas(cellW, cellH)
-	if title != "" && atlas != nil {
-		maxCells := (box.x1 - box.x0) / atlas.w
-		label := truncate(title, maxCells-6)
-		if label != "" {
-			tw := len(label) * atlas.w
-			ph := atlas.h + 2
-			py := box.y1 - t/2 - ph/2
-			px0 := (box.x0+box.x1)/2 - (tw+2*atlas.w)/2
-			px1 := px0 + tw + 2*atlas.w
-			pill(dst, cw, chh, rect{px0, py, px1, py + ph}, col)
-			drawText(dst, cw, chh, px0+atlas.w, py+1, label, contrastText(col), atlas)
-			skip = rect{px0, box.y1 - t, px1, box.y1 + t}
-		}
+	hookedRect(dst, cw, chh, box, t, rad, col, rect{})
+}
+
+// badgeBox is where a window's title badge sits: inline in its bottom rule,
+// centred, the way tuios places a bottom-positioned pane title.
+func (r *renderer) badgeBox(w *window, focused bool) (rect, string, *fontAtlas) {
+	comp := r.comp
+	cellW, cellH := comp.cellW, comp.cellH
+	box := rect{
+		w.area.x0 - cellW/2, w.area.y0 - cellH/2,
+		w.area.x1 + cellW/2, w.area.y1 + cellH/2,
 	}
-	hookedRect(dst, cw, chh, box, t, rad, col, skip)
+	atlas := pickAtlas(cellW, cellH)
+	title := w.title()
+	if title == "" || atlas == nil {
+		return rect{}, "", nil
+	}
+	label := truncate(title, (box.x1-box.x0)/atlas.w-6)
+	if label == "" {
+		return rect{}, "", nil
+	}
+	tw := len(label) * atlas.w
+	ph := atlas.h + 2
+	py := box.y1 - ph/2
+	px0 := (box.x0+box.x1)/2 - (tw+2*atlas.w)/2
+	return rect{px0, py, px0 + tw + 2*atlas.w, py + ph}, label, atlas
+}
+
+// drawBadge paints one title badge. Badges are drawn after every rule, so a
+// neighbour's rule never strikes through a title.
+func (r *renderer) drawBadge(w *window, focused bool) {
+	comp := r.comp
+	box, label, atlas := r.badgeBox(w, focused)
+	if atlas == nil {
+		return
+	}
+	col := pal.structure
+	if focused {
+		col = pal.focus
+	}
+	pill(comp.frame, comp.frameW, comp.frameH, box, col)
+	drawText(comp.frame, comp.frameW, comp.frameH, box.x0+atlas.w, box.y0+1,
+		label, contrastText(col), atlas)
 }
 
 // drawDock reproduces tuios's two-row dock: a full-width hairline in the
@@ -456,17 +479,58 @@ func (r *renderer) drawDock() {
 	}
 }
 
-// drawChrome repaints the ground, every rule and the dock. It runs on layout
-// or focus change, never per frame: guest pixels never touch these bytes,
-// because every window is clipped to its own content rectangle.
-func (r *renderer) drawChrome() {
+// ruleBand is the region a window's rule and badge occupy: one cell out
+// from its content rectangle on every side. Neighbouring tiles are exactly
+// two cells apart, so a band never reaches into another tile's content.
+func (comp *compositor) ruleBand(w *window) [4]rect {
+	cw, ch := comp.cellW, comp.cellH
+	o := rect{w.area.x0 - cw, w.area.y0 - ch, w.area.x1 + cw, w.area.y1 + ch}
+	return [4]rect{
+		{o.x0, o.y0, o.x1, w.area.y0},
+		{o.x0, w.area.y1, o.x1, o.y1},
+		{o.x0, w.area.y0, w.area.x0, w.area.y1},
+		{w.area.x1, w.area.y0, o.x1, w.area.y1},
+	}
+}
+
+// drawChrome repaints the frame and returns the canvas region it touched.
+//
+// full repaints the ground under everything, which is only correct right
+// after a relayout, when every tile is going to be recomposited anyway.
+// Otherwise only the rule bands and the dock are cleared and redrawn, so a
+// focus change never disturbs a single guest pixel.
+func (r *renderer) drawChrome(full bool) rect {
 	comp := r.comp
-	fillRect(comp.frame, comp.frameW, comp.frameH, rect{0, 0, comp.frameW, comp.frameH}, pal.ground)
+	dmg := rect{}
+	if full {
+		fillRect(comp.frame, comp.frameW, comp.frameH, rect{0, 0, comp.frameW, comp.frameH}, pal.ground)
+		dmg = rect{0, 0, comp.frameW, comp.frameH}
+	} else {
+		for _, w := range comp.windows {
+			if w.area.empty() {
+				continue
+			}
+			for _, b := range comp.ruleBand(w) {
+				fillRect(comp.frame, comp.frameW, comp.frameH, b.clip(comp.frameW, comp.frameH), pal.ground)
+				dmg = dmg.union(b.clip(comp.frameW, comp.frameH))
+			}
+		}
+		dockTop := (comp.frameH/comp.cellH - dockRows) * comp.cellH
+		dock := rect{0, dockTop, comp.frameW, comp.frameH}
+		fillRect(comp.frame, comp.frameW, comp.frameH, dock, pal.ground)
+		dmg = dmg.union(dock)
+	}
+	// A tile's content area is only cleared when its client has not drawn
+	// yet. Live guest pixels are never touched by a chrome repaint, which
+	// is what lets focus changes cost a frame of rules instead of a full
+	// recomposite of every window.
 	for _, w := range comp.windows {
 		if w.area.empty() {
 			continue
 		}
-		fillRect(comp.frame, comp.frameW, comp.frameH, w.area, pal.empty)
+		if w.top == nil || w.top.surf == nil || w.top.surf.content == nil {
+			fillRect(comp.frame, comp.frameW, comp.frameH, w.area, pal.empty)
+		}
 	}
 	// Unfocused rules first, focused last, so the owned rule wins wherever
 	// two tiles meet.
@@ -479,10 +543,16 @@ func (r *renderer) drawChrome() {
 	if comp.focus != nil && !comp.focus.area.empty() {
 		r.drawWindowRule(comp.focus, true)
 	}
+	for _, w := range comp.windows {
+		if !w.area.empty() {
+			r.drawBadge(w, w == comp.focus)
+		}
+	}
 	r.drawDock()
 	if len(comp.windows) == 0 {
 		r.drawSplash()
 	}
+	return dmg
 }
 
 func (r *renderer) drawSplash() {

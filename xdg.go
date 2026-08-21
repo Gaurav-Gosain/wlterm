@@ -46,6 +46,8 @@ func (s *wlSurface) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		} else if b, ok := c.get(bufID).(*wlBuffer); ok {
 			s.pendingBuf = b
 			s.pendingBuf.id = bufID
+		} else {
+			s.pendingBuf = nil
 		}
 		s.pendingBufSet = true
 	case 2: // damage(x, y, w, h) - surface coords; buffer scale 1 so same

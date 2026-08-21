@@ -331,7 +331,7 @@ func (comp *compositor) relayout() {
 		}
 		w.area = w.cell.px(cw, ch)
 	}
-	comp.chromeDirty = true
+	comp.chromeLayout = true
 	comp.configureAll()
 	for _, w := range wins {
 		if w.area.empty() {
