@@ -77,7 +77,7 @@ const (
 func main() {
 	width := flag.Int("w", 1280, "width")
 	height := flag.Int("h", 720, "height")
-	work := flag.String("work", "full", "full|rect|evil")
+	work := flag.String("work", "full", "full|rect|idle|evil")
 	dur := flag.Int("dur", 10, "seconds to run")
 	flag.Parse()
 	W, H := *width, *height
@@ -121,6 +121,28 @@ func main() {
 	put(surfID, 6)                                // commit -> configure
 	flush()
 
+	// Take the size the compositor configured us with. Under a tiler that
+	// is the tile's rectangle, not the screen, so the client must ask
+	// before it allocates.
+	var ackSerial uint32
+	readMsgs(func(obj uint32, op uint16, data []byte) bool {
+		if obj == topID && op == 0 {
+			cw := int(int32(binary.LittleEndian.Uint32(data)))
+			chh := int(int32(binary.LittleEndian.Uint32(data[4:])))
+			if cw > 0 && chh > 0 {
+				W, H = cw, chh
+			}
+		}
+		if obj == xsurfID && op == 0 {
+			ackSerial = binary.LittleEndian.Uint32(data)
+			return false
+		}
+		return true
+	})
+	put(xsurfID, 4, ackSerial) // ack_configure
+	flush()
+	fmt.Fprintf(os.Stderr, "BENCH configured %dx%d\n", W, H)
+
 	poolSize := W * H * 4 * 2
 	fd, _ := memfd()
 	syscall.Ftruncate(fd, int64(poolSize))
@@ -131,16 +153,6 @@ func main() {
 	put(poolID, 0, uint32(buf1), int32(W*H*4), int32(W), int32(H), int32(W*4), uint32(1))
 	flush()
 
-	readMsgs(func(obj uint32, op uint16, data []byte) bool {
-		if obj == xsurfID && op == 0 {
-			serial := binary.LittleEndian.Uint32(data)
-			put(xsurfID, 4, serial) // ack_configure
-			flush()
-			return false
-		}
-		return true
-	})
-
 	frames := 0
 	cur := 0
 	cb := uint32(cbBase)
@@ -150,6 +162,12 @@ func main() {
 	draw := func(n int) {
 		base := cur * W * H * 4
 		px := mem[base : base+W*H*4]
+		if *work == "idle" {
+			for i := 0; i < len(px); i += 4 {
+				px[i], px[i+1], px[i+2], px[i+3] = 0x28, 0x30, 0x3c, 0xff
+			}
+			return
+		}
 		if *work == "full" {
 			v := byte(n)
 			for i := 0; i < len(px); i += 4 {
@@ -200,6 +218,13 @@ func main() {
 	}
 
 	commit(0)
+	if *work == "idle" {
+		// Paint once and stop: a window that is simply on screen, which is
+		// the case that decides whether N tiles cost N times as much.
+		time.Sleep(time.Until(deadline))
+		fmt.Fprintf(os.Stderr, "BENCH idle %dx%d: 1 frame\n", W, H)
+		return
+	}
 	n := 1
 	for time.Now().Before(deadline) {
 		done := false

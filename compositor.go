@@ -160,6 +160,13 @@ func (comp *compositor) clientGone(c *client) {
 	for _, w := range doomed {
 		comp.removeWindow(w)
 	}
+	live := comp.popups[:0]
+	for _, p := range comp.popups {
+		if p.xdg == nil || p.xdg.surf == nil || p.xdg.surf.client != c {
+			live = append(live, p)
+		}
+	}
+	comp.popups = live
 	if comp.pointerFocus != nil && comp.pointerFocus.client == c {
 		comp.pointerFocus = nil
 	}

@@ -141,7 +141,7 @@ func (r *renderer) frame() {
 		})
 		w.dmg = rect{}
 		w.needsFull = false
-		w.placed = true
+		w.placed = r.layered
 	}
 	t1 := time.Now()
 

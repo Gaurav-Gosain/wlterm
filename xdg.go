@@ -318,6 +318,9 @@ func (x *xdgSurface) iface() string { return "xdg_surface" }
 func (x *xdgSurface) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	switch opcode {
 	case 0: // destroy
+		if x.popup != nil {
+			c.comp.dropPopup(x.popup)
+		}
 		if x.surf != nil {
 			x.surf.role = nil
 		}
