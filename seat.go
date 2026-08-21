@@ -96,6 +96,7 @@ func (ss *seatState) dropPointer(c *client, id uint32) {
 		}
 	}
 }
+
 // dropClient forgets every seat resource a disconnected client held.
 func (ss *seatState) dropClient(c *client) {
 	ps := ss.pointers[:0]
@@ -162,4 +163,3 @@ func memfdCreate(name string) (int, error) {
 }
 
 func nowMs() uint32 { return uint32(time.Now().UnixNano() / 1e6) }
-

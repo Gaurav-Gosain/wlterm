@@ -98,7 +98,6 @@ type launcher struct {
 	pad     int
 	border  int
 	rowH    int
-	promptH int
 	listTop int
 	visible int
 
@@ -320,8 +319,7 @@ func (lc *launcher) layout() bool {
 	if lc.rowH < atlas.h+4 {
 		lc.rowH = atlas.h + 4
 	}
-	lc.promptH = lc.rowH + lc.pad
-	lc.listTop = lc.border + lc.pad + lc.promptH + lc.pad
+	lc.listTop = lc.border + lc.pad + (lc.rowH + lc.pad) + lc.pad
 	lc.visible = (lc.pixH - lc.listTop - lc.border - lc.pad) / lc.rowH
 	if lc.visible < 1 {
 		lc.visible = 1

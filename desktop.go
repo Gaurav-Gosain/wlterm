@@ -44,16 +44,13 @@ import (
 // ---- raw file model ----
 
 type entryGroup struct {
-	name string
 	keys map[string]string // key (with any [locale] suffix intact) -> raw value
-	ord  []string
 }
 
 type entryFile struct {
 	path   string
 	id     string // desktop file ID
 	groups map[string]*entryGroup
-	order  []string
 }
 
 func (f *entryFile) group(name string) *entryGroup { return f.groups[name] }
@@ -200,9 +197,8 @@ func parseEntryFile(path string) (*entryFile, error) {
 			if g, ok := ef.groups[name]; ok {
 				cur = g
 			} else {
-				cur = &entryGroup{name: name, keys: map[string]string{}}
+				cur = &entryGroup{keys: map[string]string{}}
 				ef.groups[name] = cur
-				ef.order = append(ef.order, name)
 			}
 			continue
 		}
@@ -222,7 +218,6 @@ func parseEntryFile(path string) (*entryFile, error) {
 			continue
 		}
 		cur.keys[key] = val
-		cur.ord = append(cur.ord, key)
 	}
 	return ef, sc.Err()
 }

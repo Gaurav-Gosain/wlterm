@@ -13,10 +13,7 @@ package main
 // are lifted to the loudest ink the panel allows AND underlined, so the
 // highlight never rests on colour alone.
 
-import (
-	"fmt"
-	"time"
-)
+import "time"
 
 // repaint redraws the panel and returns the canvas-space rectangles that
 // have to be retransmitted.
@@ -351,9 +348,4 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func (lc *launcher) debugLine() string {
-	return fmt.Sprintf("launcher rows=%d sel=%d visible=%d panel=%dx%d at cell %d,%d",
-		len(lc.rows), lc.sel, lc.visible, lc.pixW, lc.pixH, lc.cell.x, lc.cell.y)
 }
