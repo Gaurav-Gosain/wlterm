@@ -31,7 +31,8 @@ type_str(){ local s="$1"; local i c; for ((i=0;i<${#s};i++)); do c="${s:$i:1}"; 
      -spawn "foot -T shell sh -c 'exec sh'" \
      -exec "foot -T foot-one sh -c 'echo a real terminal; exec sh'" \
      -exec "foot -T foot-two sh -c 'echo another one; exec sh'" \
-     -exec "gtk-demo" \
+     -exec "evince /tmp/wlterm-demo.pdf" \
+     -exec "sleep 2; kitty -o confirm_os_window_close=0 -e sh -c 'echo kitty on llvmpipe; exec sh'" \
      >/dev/null 2>&1
 
 echo "frames: $(ls "$OUT/snaps" | wc -l)"

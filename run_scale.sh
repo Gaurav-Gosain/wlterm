@@ -23,10 +23,12 @@ for n in 1 2 4; do
   for ((i=0;i<n;i++)); do
     w=rect
     if [ "$load" = one ] && [ $i -gt 0 ]; then w=idle; fi
-    args+=(-exec "$BENCH -work $w -dur $((DUR+4))")
+    # Stagger so the tiling comes out the same every run: the busy client
+    # always connects first and always lands in the same tile.
+    args+=(-exec "sleep 0.$((3*i)); $BENCH -work $w -dur $((DUR+4))")
   done
   log=$OUT/$load-$layers-$mode-$n.log
-  timeout $((DUR+8)) ./wlterm -pixels 1440x800 -cell 9x18 -mode $mode -layers $layers \
+  timeout $((DUR+10)) ./wlterm -pixels 1440x800 -cell 9x18 -mode $mode -layers $layers \
       -fps 1000 -log "$log" "${args[@]}" >/dev/null 2>&1
   # Ignore the first two seconds of samples: startup and first configure.
   line=$(grep "stats:" "$log" | tail -n +3 | python3 -c '

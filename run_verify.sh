@@ -12,12 +12,12 @@ BENCH=$PWD/wlbench/wlbench
 
 for layers in per-window single; do
   rm -rf "$OUT/$layers"; mkdir -p "$OUT/$layers/snaps"
-  timeout 16 ./wlterm -pixels 1440x800 -cell 9x18 -mode b64 -layers $layers -fps 30 \
+  timeout 10 ./wlterm -pixels 1440x800 -cell 9x18 -mode b64 -layers $layers -fps 30 \
     -log "$OUT/$layers/log" -snapshots "$OUT/$layers/snaps" -snapshot-every 400ms \
-    -exec "$BENCH -work idle -dur 11" \
-    -exec "sleep 1.5; $BENCH -work idle -dur 9" \
-    -exec "sleep 3; $BENCH -work idle -dur 8" \
-    -exec "sleep 4.5; $BENCH -work idle -dur 6" \
+    -exec "$BENCH -work idle -dur 30" \
+    -exec "sleep 1; $BENCH -work idle -dur 30" \
+    -exec "sleep 2; $BENCH -work idle -dur 30" \
+    -exec "sleep 3; $BENCH -work idle -dur 30" \
     > "$OUT/$layers/stream.bin" 2>/dev/null
   ./kittydec/kittydec -in "$OUT/$layers/stream.bin" -out "$OUT/$layers/decoded.png" -cell 9x18 -size 1440x800
   last=$(ls "$OUT/$layers/snaps" | tail -1)
