@@ -18,6 +18,13 @@ const (
 	btnMiddle = 0x112
 )
 
+// quitWindow is how close together the two taps of the escape hatch have to
+// be. kcBackslash is evdev KEY_BACKSLASH.
+const (
+	quitWindow  = 700 * time.Millisecond
+	kcBackslash = 43
+)
+
 type inputParser struct {
 	comp       *compositor
 	buf        []byte
@@ -26,6 +33,13 @@ type inputParser struct {
 	headless   bool
 	lastQuit   time.Time
 	quit       chan struct{}
+
+	// quitKey is the evdev code of the escape hatch, tapped twice inside
+	// quitWindow. Zero means no key is intercepted at all and every byte
+	// that arrives reaches the guest, which is the single-app default.
+	quitKey  uint32
+	quitMods uint32
+	quitName string
 
 	// responses to startup queries land here
 	cellW, cellH int
@@ -233,13 +247,17 @@ func (p *inputParser) kittyKey(body string) {
 		mods, event, explicit = parseModsEvent("1;" + parts[1])
 	}
 
-	// Ctrl+backslash twice quickly = quit wlterm.
-	if cp == 92 && mods&4 != 0 && event == 1 {
-		if time.Since(p.lastQuit) < 700*time.Millisecond {
-			close(p.quit)
-			return
+	// The escape hatch, tapped twice quickly. The first tap still reaches
+	// the guest, so a single press is not swallowed.
+	if p.quitKey != 0 && event == 1 {
+		if code, ok := codeToEvdev[uint32(cp)]; ok &&
+			code == p.quitKey && mods&p.quitMods == p.quitMods {
+			if time.Since(p.lastQuit) < quitWindow {
+				close(p.quit)
+				return
+			}
+			p.lastQuit = time.Now()
 		}
-		p.lastQuit = time.Now()
 	}
 
 	code, ok := codeToEvdev[uint32(cp)]
@@ -303,12 +321,14 @@ func (p *inputParser) tap(code uint32, mods uint32) {
 func (p *inputParser) legacyByte(b byte) {
 	switch {
 	case b == 0x1c: // ctrl+backslash
-		if time.Since(p.lastQuit) < 700*time.Millisecond {
-			close(p.quit)
-			return
+		if p.quitKey == kcBackslash && p.quitMods&4 != 0 {
+			if time.Since(p.lastQuit) < quitWindow {
+				close(p.quit)
+				return
+			}
+			p.lastQuit = time.Now()
 		}
-		p.lastQuit = time.Now()
-		p.tapLegacy(43, 4)
+		p.tapLegacy(kcBackslash, 4)
 	case b >= 1 && b <= 26 && b != 9 && b != 13: // ctrl+letter
 		p.tapLegacy(codeToEvdev[uint32('a'+b-1)], 4)
 	case b == 9 || b == 13 || b == 127 || b == 27:

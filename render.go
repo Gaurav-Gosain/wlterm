@@ -41,6 +41,8 @@ type renderStats struct {
 	images      atomic.Uint64
 	overlayPx   atomic.Uint64
 	overlayOps  atomic.Uint64
+	chromeNs    atomic.Uint64
+	chromeOps   atomic.Uint64
 	shmCopies   atomic.Uint64
 	shmCopyNs   atomic.Uint64
 	dmaCopies   atomic.Uint64
@@ -113,8 +115,14 @@ func (r *renderer) frame() {
 	if comp.chromeLayout || comp.chromeDirty {
 		full := comp.chromeLayout
 		comp.chromeLayout, comp.chromeDirty = false, false
-		r.rootDmg = r.rootDmg.union(r.drawChrome(full))
-		r.rootDirty = true
+		tc := time.Now()
+		r.rootDmg = r.rootDmg.union(r.drawBackdrop(full))
+		stats.chromeNs.Add(uint64(time.Since(tc)))
+		stats.chromeOps.Add(1)
+		// In single-app mode with per-window layers the root image is
+		// entirely covered by the one tile at z=1, so it is composited
+		// (the tile is extracted from this canvas) but never transmitted.
+		r.rootDirty = !(comp.single && r.layered)
 		if full {
 			// The ground was repainted under every tile, so every tile owes
 			// a recomposite. This is the expensive path, and it only runs
@@ -702,6 +710,11 @@ func statsLine(elapsed time.Duration) string {
 	if n := stats.dmaCopies.Swap(0); n > 0 {
 		fmt.Fprintf(&b, " dmabuf_read=%v(sync %v)/n=%d",
 			time.Duration(stats.dmaCopyNs.Swap(0)/n), time.Duration(stats.dmaSyncNs.Swap(0)/n), n)
+	}
+	if ops := stats.chromeOps.Swap(0); ops > 0 {
+		fmt.Fprintf(&b, " chrome_repaints=%d chrome=%v", ops, time.Duration(stats.chromeNs.Swap(0)/ops))
+	} else {
+		stats.chromeNs.Store(0)
 	}
 	if ops := stats.overlayOps.Swap(0); ops > 0 {
 		fmt.Fprintf(&b, " overlay_updates=%d overlay_px=%d", ops, stats.overlayPx.Swap(0))

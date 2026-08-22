@@ -419,6 +419,12 @@ func (x *xdgSurface) sendConfigure(c *client, comp *compositor) {
 // that understand them square off their corners.
 func toplevelStates(comp *compositor, t *xdgToplevel) []byte {
 	states := []uint32{1} // maximized
+	if comp.single {
+		// The pane is the screen. Fullscreen says that in the one term
+		// every toolkit understands: no decorations, no shadow, no rounded
+		// corners, no client-side title bar to sit inside tuios's own.
+		states = append(states, 2) // fullscreen
+	}
 	if t.win != nil && comp.focus == t.win {
 		states = append(states, 4) // activated
 	}
@@ -480,23 +486,25 @@ func (t *xdgToplevel) handle(c *client, id uint32, opcode uint16, r *argReader) 
 		c.deleteID(id)
 	case 2: // set_title
 		t.title = r.string()
-		if t.win != nil {
+		// Nothing in single-app mode draws the title: tuios does.
+		if t.win != nil && !c.comp.single {
 			c.comp.chromeDirty = true
 			c.comp.markDirty()
 		}
 	case 3: // set_app_id
 		t.appID = r.string()
-		if t.win != nil && t.title == "" {
+		if t.win != nil && t.title == "" && !c.comp.single {
 			c.comp.chromeDirty = true
 			c.comp.markDirty()
 		}
 	case 11: // set_fullscreen -> the tile is the world; zoom instead
-		if t.win != nil {
+		// Already fullscreen in single-app mode, so there is nothing to do.
+		if t.win != nil && !c.comp.single {
 			c.comp.zoomed = t.win
 			c.comp.relayout()
 		}
 	case 12: // unset_fullscreen
-		if c.comp.zoomed == t.win {
+		if c.comp.zoomed == t.win && !c.comp.single {
 			c.comp.zoomed = nil
 			c.comp.relayout()
 		}

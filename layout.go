@@ -301,6 +301,10 @@ func (comp *compositor) relayout() {
 	if cw <= 0 || ch <= 0 || comp.widthPx <= 0 {
 		return
 	}
+	if comp.single {
+		comp.relayoutSingle()
+		return
+	}
 	cols, rows := comp.widthPx/cw, comp.heightPx/ch
 	// One cell of outer margin so the outermost rule has a cell to live in,
 	// and two rows at the bottom for the dock: a hairline and a bar.
@@ -343,6 +347,47 @@ func (comp *compositor) relayout() {
 		}
 		w.needsFull = true
 		w.dmg.set(w.area)
+	}
+	comp.markDirty()
+}
+
+// relayoutSingle is the whole layout engine in single-app mode: the newest
+// mapped toplevel gets the entire pane, in pixels, and everything else gets
+// nothing.
+//
+// Two things are deliberately different from the tiling path. There is no
+// one-cell margin and no dock reservation, so the client's rectangle is the
+// pane exactly rather than the pane minus a frame; and the rectangle is not
+// quantised to whole cells, because nothing is being drawn around it that
+// would need to line up with the terminal grid. At a 10x20 cell that is the
+// difference between a client sized 1260x640 and one sized 1280x720.
+//
+// Extra toplevels stack rather than tile: the newest is on top and owns the
+// pane, the ones underneath are hidden. That is what a dialog wants, and it
+// is what cage does with the same input.
+func (comp *compositor) relayoutSingle() {
+	full := rect{0, 0, comp.widthPx, comp.heightPx}
+	comp.region = cellRect{0, 0, comp.widthPx / comp.cellW, comp.heightPx / comp.cellH}
+	var top *window
+	for _, w := range comp.windows {
+		w.cell = cellRect{}
+		if !w.area.empty() {
+			// A window that had the pane and is losing it owes the ground
+			// underneath a repaint.
+			comp.chromeLayout = true
+		}
+		w.area = rect{}
+		top = w
+	}
+	if top != nil {
+		top.cell = comp.region
+		top.area = full
+	}
+	comp.setFocus(top) // no-op when the same window still owns the pane
+	comp.configureAll()
+	if top != nil {
+		top.needsFull = true
+		top.dmg.set(top.area)
 	}
 	comp.markDirty()
 }

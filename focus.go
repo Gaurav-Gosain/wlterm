@@ -23,7 +23,11 @@ func (comp *compositor) setFocus(w *window) {
 	// The activated state is part of the configure, so clients repaint
 	// their own title bars and cursors correctly.
 	comp.configureAll()
-	comp.chromeDirty = true
+	// Nothing in single-app mode is drawn differently when focus moves:
+	// there is no focus ring of wlterm's own and no dock to update.
+	if !comp.single {
+		comp.chromeDirty = true
+	}
 	comp.markDirty()
 }
 

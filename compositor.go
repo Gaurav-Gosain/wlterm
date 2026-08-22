@@ -33,6 +33,12 @@ type compositor struct {
 	clients   map[*client]bool
 	seatState seatState
 
+	// single is the default mode: one toplevel filling the pane, no chrome,
+	// no prefix key, no launcher. The tiling fields below still exist (a
+	// window is still how a toplevel is tracked) but the BSP tree, the
+	// layout modes and every keybinding are inert.
+	single bool
+
 	// Tiling state. windows is creation order (master-stack reads it as
 	// master-first); root is the BSP tree over the same set.
 	windows     []*window

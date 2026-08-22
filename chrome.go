@@ -623,6 +623,28 @@ func (comp *compositor) ruleBand(w *window) [4]rect {
 	}
 }
 
+// drawBackdrop repaints whatever lives under the guests and returns the
+// canvas region it touched.
+//
+// In single-app mode that is one flood fill and nothing else. There is no
+// frame, no title, no focus ring and no dock, because tuios already draws
+// all four around the pane and a second set inside it is noise. The fill
+// still has to happen: a client whose surface is smaller than the pane (one
+// that has not yet acked its configure, or one that simply ignores the size)
+// would otherwise expose whatever the canvas held before.
+func (r *renderer) drawBackdrop(full bool) rect {
+	comp := r.comp
+	if !comp.single {
+		return r.drawChrome(full)
+	}
+	if !full {
+		return rect{}
+	}
+	all := rect{0, 0, comp.frameW, comp.frameH}
+	fillRect(comp.frame, comp.frameW, comp.frameH, all, pal.ground)
+	return all
+}
+
 // drawChrome repaints the frame and returns the canvas region it touched.
 //
 // full repaints the ground under everything, which is only correct right

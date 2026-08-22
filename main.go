@@ -1,15 +1,30 @@
 package main
 
-// wlterm: a tiling Wayland compositor that lives inside a terminal pane.
-// Clients render via wl_shm; wlterm tiles them, draws a tuios-shaped frame
-// around them, and writes the result to stdout as kitty graphics.
+// wlterm: a Wayland compositor that lives inside a terminal pane. Clients
+// render via wl_shm or a LINEAR dmabuf; wlterm composites them and writes
+// the result to stdout as kitty graphics.
 //
 //	wlterm [flags] -- CMD...
+//
+// Two modes. The default is single-app: one toplevel filling the pane, no
+// chrome of wlterm's own, no leader key, no launcher. That is the mode for
+// running a Wayland program inside a multiplexer that already draws the
+// border, the title and the focus ring and already owns ctrl+b.
+//
+//	wlterm -- foot          a Wayland terminal in a tuios pane
+//
+// -multi restores the tiling compositor: a BSP layout, a tuios-shaped frame
+// per window, a dock, a leader key and an application launcher.
+//
+//	wlterm -multi -- foot
+//
+//	  -multi        multi-surface tiling mode (default: single app)
 //	  -exec CMD     launch another client at startup (repeatable)
-//	  -spawn CMD    command bound to <prefix> c
+//	  -spawn CMD    command bound to <prefix> c        (-multi only)
 //	  -mode         b64 | shm | delta   transport
 //	  -layers       single | per-window granularity
-//	  -prefix       compositor leader key, default ctrl+b
+//	  -prefix       leader key, default ctrl+b         (-multi only)
+//	  -quit-key     escape hatch, tapped twice; "none" to intercept nothing
 //	  -no-dmabuf    do not advertise zwp_linux_dmabuf_v1
 //	  -drm NODE     render node to advertise as dmabuf main_device
 //
@@ -45,7 +60,9 @@ func main() {
 	cellSize := flag.String("cell", "10x20", "headless cell size WxH")
 	socketName := flag.String("socket", "", "wayland socket name (default wlterm-PID)")
 	stampPath := flag.String("stamp", "", "write per-frame wallclock ms to this file")
-	prefix := flag.String("prefix", "ctrl+b", "compositor leader key")
+	multi := flag.Bool("multi", false, "multi-surface tiling mode: chrome, leader key, launcher")
+	prefix := flag.String("prefix", "ctrl+b", "leader key (-multi only)")
+	quitKey := flag.String("quit-key", "ctrl+backslash", "escape hatch, tapped twice within 700ms; \"none\" intercepts nothing")
 	noDmabuf := flag.Bool("no-dmabuf", false, "do not advertise zwp_linux_dmabuf_v1")
 	drmNode := flag.String("drm", "", "render node to advertise as dmabuf main_device")
 	isolate := flag.Bool("isolate", true, "give clients a private runtime dir and session bus")
@@ -67,23 +84,43 @@ func main() {
 	sweepOrphanShm()
 
 	comp := &compositor{
+		single:      !*multi,
 		clients:     map[*client]bool{},
 		renderCh:    make(chan struct{}, 1),
 		nextImgID:   100,
 		masterRatio: masterRatio,
-		spawnCmd:    []string{"/bin/sh", "-c", *spawnCmd},
-		prefixName:  *prefix,
 		swallow:     map[uint32]bool{},
-		termCmd:     defaultTermCmd(*termCmd),
 	}
-	if code, mods, ok := prefixFromName(*prefix); ok {
-		comp.prefixCode, comp.prefixMods = code, mods
-	} else {
-		fmt.Fprintf(os.Stderr, "unparsable -prefix %q\n", *prefix)
-		os.Exit(2)
+	// Everything below this line exists to be navigated between windows.
+	// In single-app mode there is nothing to navigate, so there is no
+	// leader key: prefixCode stays zero and handleKey hands every key
+	// straight to the guest. This is not a nicety. wlterm's leader was
+	// ctrl+b and so is tuios's, so inside a tuios pane the leader never
+	// arrived and every binding it guarded was unreachable anyway.
+	if *multi {
+		comp.spawnCmd = []string{"/bin/sh", "-c", *spawnCmd}
+		comp.prefixName = *prefix
+		comp.termCmd = defaultTermCmd(*termCmd)
+		if code, mods, ok := prefixFromName(*prefix); ok {
+			comp.prefixCode, comp.prefixMods = code, mods
+		} else {
+			fmt.Fprintf(os.Stderr, "unparsable -prefix %q\n", *prefix)
+			os.Exit(2)
+		}
 	}
 
 	p := newInputParser(comp)
+	// The escape hatch. Two taps inside 700ms, so a single press still
+	// reaches the guest; ctrl+backslash because tuios does not bind it and
+	// nothing types it twice in a row on purpose.
+	if *quitKey != "" && *quitKey != "none" {
+		code, mods, ok := prefixFromName(strings.Replace(*quitKey, "backslash", "\\", 1))
+		if !ok {
+			fmt.Fprintf(os.Stderr, "unparsable -quit-key %q\n", *quitKey)
+			os.Exit(2)
+		}
+		p.quitKey, p.quitMods, p.quitName = code, mods, *quitKey
+	}
 
 	headless := *pixels != ""
 	if headless {
@@ -111,14 +148,26 @@ func main() {
 			*mode = "shm"
 		}
 	}
-	logf("mode=%s layers=%s size=%dx%d cell=%dx%d", *mode, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH)
+	kind := "single-app"
+	if *multi {
+		kind = "multi-surface"
+	}
+	quitDesc := "none (the app exiting, or a signal, is the only way out)"
+	if p.quitKey != 0 {
+		quitDesc = p.quitName + " twice within " + quitWindow.String()
+	}
+	logf("%s: mode=%s layers=%s size=%dx%d cell=%dx%d leader=%s quit=%s",
+		kind, *mode, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH,
+		orNone(comp.prefixName), quitDesc)
+	if *multi {
+		logf("chrome: %s", reportContrast())
+		logf("chrome: %s", reportPanelContrast())
+	}
 	if !*noDmabuf {
 		initDmabuf(*drmNode)
 	} else {
 		logf("dmabuf: disabled by -no-dmabuf; clients fall back to wl_shm")
 	}
-	logf("chrome: %s", reportContrast())
-	logf("chrome: %s", reportPanelContrast())
 
 	// Client isolation.
 	//
@@ -297,9 +346,11 @@ func main() {
 	// desktop entries whose entire purpose is desktop integration, so it is
 	// the single feature most likely to reintroduce the escape that put a
 	// file manager on the host desktop.
-	comp.lc = newLauncher(comp, comp.nextImgID)
-	comp.nextImgID++
-	comp.lc.warm()
+	if *multi {
+		comp.lc = newLauncher(comp, comp.nextImgID)
+		comp.nextImgID++
+		comp.lc.warm()
+	}
 
 	for _, e := range execs {
 		launch(spawnReq{argv: []string{"/bin/sh", "-c", e}, label: e})
@@ -308,11 +359,17 @@ func main() {
 		launch(spawnReq{argv: args})
 	}
 	if started == 0 {
-		logf("no initial client; use %s c", *prefix)
+		if *multi {
+			logf("no initial client; use %s c", *prefix)
+		} else {
+			fmt.Fprintln(os.Stderr, "wlterm: nothing to run. Try: wlterm -- foot")
+			cleanup(headless)
+			os.Exit(2)
+		}
 	}
 
 	sigCh := make(chan os.Signal, 4)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGWINCH)
 
 	statsT := time.NewTicker(time.Second)
 	defer statsT.Stop()
@@ -553,4 +610,11 @@ func cleanup(headless bool) {
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
