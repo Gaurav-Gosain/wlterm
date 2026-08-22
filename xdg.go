@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/binary"
 	"runtime/debug"
+	"time"
 )
 
 // ---- wl_surface ----
@@ -218,11 +219,24 @@ func isChildOf(s, top *wlSurface) bool {
 	return false
 }
 
-// copyFromBuffer copies the client's shm pixels into surface-owned memory,
-// converting stride to tight w*4 rows. Keeps BGRA byte order (swizzled later).
-// A client can truncate the pool file after validation; SetPanicOnFault turns
-// the resulting SIGBUS into a recoverable panic instead of killing us.
+// copyFromBuffer copies the client's pixels (shm pool or mmap'd LINEAR
+// dmabuf) into surface-owned memory, converting stride to tight w*4 rows.
+// Keeps BGRA byte order (swizzled later). A client can truncate the backing
+// file after validation; SetPanicOnFault turns the resulting SIGBUS into a
+// recoverable panic instead of killing us.
 func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
+	t0 := time.Now()
+	defer func() {
+		d := uint64(time.Since(t0))
+		if b.dma != nil {
+			stats.dmaCopies.Add(1)
+			stats.dmaCopyNs.Add(d)
+			checkDmabufBandwidth(b, d)
+		} else {
+			stats.shmCopies.Add(1)
+			stats.shmCopyNs.Add(d)
+		}
+	}()
 	old := debug.SetPanicOnFault(true)
 	defer func() {
 		debug.SetPanicOnFault(old)
@@ -238,7 +252,17 @@ func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
 	}
 	s.content = s.content[:need]
 	s.w, s.h = b.w, b.h
-	src := b.pool.data
+	if b.dma != nil && dmabufSync {
+		ts := time.Now()
+		b.dma.sync(true)
+		stats.dmaSyncNs.Add(uint64(time.Since(ts)))
+		defer func() {
+			te := time.Now()
+			b.dma.sync(false)
+			stats.dmaSyncNs.Add(uint64(time.Since(te)))
+		}()
+	}
+	src := b.pixels()
 	for y := 0; y < b.h; y++ {
 		so := b.off + y*b.stride
 		if so+b.w*4 > len(src) {
@@ -246,7 +270,15 @@ func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
 		}
 		copy(s.content[y*b.w*4:(y+1)*b.w*4], src[so:so+b.w*4])
 	}
-	if b.format == 1 { // xrgb8888: force alpha opaque
+	if b.yflip {
+		row := make([]byte, b.w*4)
+		for y, z := 0, b.h-1; y < z; y, z = y+1, z-1 {
+			copy(row, s.content[y*b.w*4:(y+1)*b.w*4])
+			copy(s.content[y*b.w*4:(y+1)*b.w*4], s.content[z*b.w*4:(z+1)*b.w*4])
+			copy(s.content[z*b.w*4:(z+1)*b.w*4], row)
+		}
+	}
+	if b.opaque { // xrgb8888: force alpha opaque
 		px := s.content
 		for i := 3; i < len(px); i += 4 {
 			px[i] = 0xff

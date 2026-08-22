@@ -41,6 +41,11 @@ type renderStats struct {
 	images      atomic.Uint64
 	overlayPx   atomic.Uint64
 	overlayOps  atomic.Uint64
+	shmCopies   atomic.Uint64
+	shmCopyNs   atomic.Uint64
+	dmaCopies   atomic.Uint64
+	dmaCopyNs   atomic.Uint64
+	dmaSyncNs   atomic.Uint64
 }
 
 var stats renderStats
@@ -691,6 +696,13 @@ func statsLine(elapsed time.Duration) string {
 	fmt.Fprintf(&b, "fps=%.1f composite=%v encode=%v write=%v commit_to_out=%v ", float64(f)/secs, comp, enc, wr, lat)
 	fmt.Fprintf(&b, "pty_bytes_per_s=%d shm_bytes_per_s=%d ", int(float64(pty)/secs), int(float64(shm)/secs))
 	fmt.Fprintf(&b, "images_per_frame=%.2f dmg_px_per_frame=%d", float64(imgs)/float64(f), px/f)
+	if n := stats.shmCopies.Swap(0); n > 0 {
+		fmt.Fprintf(&b, " shm_read=%v/n=%d", time.Duration(stats.shmCopyNs.Swap(0)/n), n)
+	}
+	if n := stats.dmaCopies.Swap(0); n > 0 {
+		fmt.Fprintf(&b, " dmabuf_read=%v(sync %v)/n=%d",
+			time.Duration(stats.dmaCopyNs.Swap(0)/n), time.Duration(stats.dmaSyncNs.Swap(0)/n), n)
+	}
 	if ops := stats.overlayOps.Swap(0); ops > 0 {
 		fmt.Fprintf(&b, " overlay_updates=%d overlay_px=%d", ops, stats.overlayPx.Swap(0))
 	}

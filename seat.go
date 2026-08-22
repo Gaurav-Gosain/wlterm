@@ -28,7 +28,14 @@ func (s *wlSeat) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		if km != nil {
 			c.event(kid, 0, uint32(1), fdArg(km.fd), uint32(km.size)) // keymap xkb_v1
 		}
-		c.event(kid, 5, int32(30), int32(400)) // repeat_info: rate 30, delay 400ms
+		// repeat_info arrived in wl_seat version 4. Sending it to a client
+		// that bound v1-v3 is an event it has no listener slot for, and a
+		// libwayland client aborts on that rather than ignoring it: vkcube
+		// died with "listener function for opcode 5 of wl_keyboard is NULL"
+		// before this check existed.
+		if s.version >= 4 {
+			c.event(kid, 5, int32(30), int32(400)) // repeat_info: rate 30, delay 400ms
+		}
 		// If this client already owns the focused surface, hand it focus
 		// now: a client may bind the keyboard after its window was mapped.
 		if f := c.comp.kbFocus; f != nil && f.client == c {

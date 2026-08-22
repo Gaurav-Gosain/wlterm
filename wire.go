@@ -61,6 +61,23 @@ type client struct {
 	// evidence the launch escaped.
 	pid int
 	sid int
+
+	nextServerID uint32
+}
+
+// newServerID allocates an object id in the server range (0xff000000 and up),
+// which the protocol reserves for objects the compositor creates. Needed by
+// zwp_linux_buffer_params_v1.create, whose wl_buffer has no client-supplied id.
+func (c *client) newServerID() uint32 {
+	if c.nextServerID < 0xff000000 {
+		c.nextServerID = 0xff000000
+	}
+	for {
+		c.nextServerID++
+		if _, taken := c.objects[c.nextServerID]; !taken {
+			return c.nextServerID
+		}
+	}
 }
 
 type object interface {

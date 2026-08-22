@@ -1,3 +1,4 @@
-wlterm
-*.mp4
-caps/
+/wlterm
+/kittydec/kittydec
+/wlbench/wlbench
+/dmaevil/dmaevil

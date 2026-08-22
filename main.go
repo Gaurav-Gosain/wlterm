@@ -10,6 +10,8 @@ package main
 //	  -mode         b64 | shm | delta   transport
 //	  -layers       single | per-window granularity
 //	  -prefix       compositor leader key, default ctrl+b
+//	  -no-dmabuf    do not advertise zwp_linux_dmabuf_v1
+//	  -drm NODE     render node to advertise as dmabuf main_device
 //
 // The Wayland socket is always wlterm's own (wlterm-<pid> under
 // XDG_RUNTIME_DIR); the host session's WAYLAND_DISPLAY is never inherited by
@@ -44,6 +46,8 @@ func main() {
 	socketName := flag.String("socket", "", "wayland socket name (default wlterm-PID)")
 	stampPath := flag.String("stamp", "", "write per-frame wallclock ms to this file")
 	prefix := flag.String("prefix", "ctrl+b", "compositor leader key")
+	noDmabuf := flag.Bool("no-dmabuf", false, "do not advertise zwp_linux_dmabuf_v1")
+	drmNode := flag.String("drm", "", "render node to advertise as dmabuf main_device")
 	isolate := flag.Bool("isolate", true, "give clients a private runtime dir and session bus")
 	spawnCmd := flag.String("spawn", "foot", "command bound to <prefix> c")
 	termCmd := flag.String("term", "foot", "terminal used for Terminal=true desktop entries")
@@ -108,6 +112,11 @@ func main() {
 		}
 	}
 	logf("mode=%s layers=%s size=%dx%d cell=%dx%d", *mode, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH)
+	if !*noDmabuf {
+		initDmabuf(*drmNode)
+	} else {
+		logf("dmabuf: disabled by -no-dmabuf; clients fall back to wl_shm")
+	}
 	logf("chrome: %s", reportContrast())
 	logf("chrome: %s", reportPanelContrast())
 

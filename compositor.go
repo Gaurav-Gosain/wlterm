@@ -158,7 +158,25 @@ func (comp *compositor) markDirty() {
 // clientGone drops every window a disconnected client owned. One client can
 // own several toplevels, and several clients can be connected at once, so
 // this is a sweep rather than a single check.
+// releaser is implemented by objects that own a kernel resource -- an fd, a
+// mapping -- which the object's own destroy request would normally free. A
+// client that just disconnects never sends those requests, so the compositor
+// has to sweep on its way out. Without this, dmaevil -case fdstorm leaks 2000
+// fds per connection and walks the process into EMFILE.
+type releaser interface{ releaseResources() }
+
 func (comp *compositor) clientGone(c *client) {
+	swept := 0
+	for id, obj := range c.objects {
+		if r, ok := obj.(releaser); ok {
+			r.releaseResources()
+			swept++
+		}
+		delete(c.objects, id)
+	}
+	if swept > 0 {
+		logf("client gone: released %d resource-owning objects", swept)
+	}
 	delete(comp.clients, c)
 	comp.seatState.dropClient(c)
 	var doomed []*window
@@ -220,10 +238,14 @@ var globalList = []globalDef{
 	{6, "wl_subcompositor", 1},
 	{7, "wl_data_device_manager", 3},
 	{8, "zxdg_decoration_manager_v1", 1},
+	{9, "zwp_linux_dmabuf_v1", 4},
 }
 
 func sendGlobals(c *client, reg uint32) {
 	for _, g := range globalList {
+		if g.iface == "zwp_linux_dmabuf_v1" && !dmabufReady {
+			continue // no usable DRM node: do not promise what we cannot map
+		}
 		c.event(reg, 0, g.name, g.iface, g.version) // wl_registry.global
 	}
 }
@@ -273,6 +295,18 @@ func (wlRegistry) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		c.objects[newID] = wlDataDeviceManager{}
 	case "zxdg_decoration_manager_v1":
 		c.objects[newID] = xdgDecorationManager{}
+	case "zwp_linux_dmabuf_v1":
+		if !dmabufReady {
+			c.protoError(id, 0, "dmabuf unavailable")
+			return
+		}
+		if version > 4 {
+			version = 4
+		}
+		c.objects[newID] = zwpLinuxDmabuf{version: version}
+		if version < 4 {
+			sendLegacyFormats(c, newID, version)
+		}
 	default:
 		logf("bind of unknown global %q", iface)
 		c.protoError(id, 0, "unknown global "+iface)
@@ -360,7 +394,7 @@ func (p *shmPool) handle(c *client, id uint32, opcode uint16, r *argReader) {
 			c.protoError(id, 1, "buffer exceeds pool")
 			return
 		}
-		c.objects[bid] = &wlBuffer{pool: p, off: int(off), w: int(w), h: int(h), stride: int(stride), format: format}
+		c.objects[bid] = &wlBuffer{pool: p, off: int(off), w: int(w), h: int(h), stride: int(stride), opaque: format == 1}
 		p.refs++
 	case 1: // destroy
 		p.dead = true
@@ -385,6 +419,12 @@ func (p *shmPool) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	}
 }
 
+func (p *shmPool) releaseResources() {
+	p.dead = true
+	p.refs = 0
+	p.maybeFree()
+}
+
 func (p *shmPool) maybeFree() {
 	if p.dead && p.refs == 0 {
 		syscall.Munmap(p.data)
@@ -393,18 +433,47 @@ func (p *shmPool) maybeFree() {
 	}
 }
 
+// wlBuffer is a client buffer wlterm can read with the CPU. It is backed
+// either by an shm pool or by a mmap'd LINEAR dmabuf; both are just bytes.
 type wlBuffer struct {
-	pool              *shmPool
+	pool              *shmPool   // shm backing, nil for dmabuf
+	dma               *dmaBuffer // dmabuf backing, nil for shm
 	id                uint32
 	off, w, h, stride int
-	format            uint32 // 0 argb8888, 1 xrgb8888
+	opaque            bool // xrgb8888: the alpha channel is meaningless
+	yflip             bool // dmabuf y_invert flag
+}
+
+// pixels returns the mapped bytes. The caller must be inside a
+// SetPanicOnFault guard: a client can shrink either backing at any time.
+func (b *wlBuffer) pixels() []byte {
+	if b.dma != nil {
+		return b.dma.data
+	}
+	if b.pool != nil {
+		return b.pool.data
+	}
+	return nil
+}
+
+func (b *wlBuffer) releaseResources() {
+	if b.dma != nil {
+		b.dma.release()
+		b.dma = nil
+	}
 }
 
 func (b *wlBuffer) iface() string { return "wl_buffer" }
 func (b *wlBuffer) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	if opcode == 0 { // destroy
-		b.pool.refs--
-		b.pool.maybeFree()
+		if b.dma != nil {
+			b.dma.release()
+			b.dma = nil
+		}
+		if b.pool != nil {
+			b.pool.refs--
+			b.pool.maybeFree()
+		}
 		c.deleteID(id)
 	}
 }
