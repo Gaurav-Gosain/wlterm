@@ -53,6 +53,8 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 func main() {
 	mode := flag.String("mode", "auto", "kitty transport: auto|delta|shm|b64")
+	autoWhy := "explicit"
+
 	layers := flag.String("layers", "per-window", "granularity: per-window|single")
 	fps := flag.Int("fps", 60, "max frames per second")
 	logPath := flag.String("log", "", "debug log file")
@@ -140,13 +142,7 @@ func main() {
 	}
 
 	if *mode == "auto" {
-		term := os.Getenv("TERM")
-		switch {
-		case strings.Contains(term, "kitty") || os.Getenv("KITTY_WINDOW_ID") != "":
-			*mode = "delta"
-		default:
-			*mode = "shm"
-		}
+		*mode, autoWhy = pickTransport()
 	}
 	kind := "single-app"
 	if *multi {
@@ -156,8 +152,8 @@ func main() {
 	if p.quitKey != 0 {
 		quitDesc = p.quitName + " twice within " + quitWindow.String()
 	}
-	logf("%s: mode=%s layers=%s size=%dx%d cell=%dx%d leader=%s quit=%s",
-		kind, *mode, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH,
+	logf("%s: mode=%s (%s) layers=%s size=%dx%d cell=%dx%d leader=%s quit=%s",
+		kind, *mode, autoWhy, *layers, comp.widthPx, comp.heightPx, comp.cellW, comp.cellH,
 		orNone(comp.prefixName), quitDesc)
 	if *multi {
 		logf("chrome: %s", reportContrast())
@@ -408,11 +404,21 @@ func main() {
 			return
 		case s := <-sigCh:
 			if s == syscall.SIGWINCH && !headless {
+				// Re-probe rather than trusting TIOCGWINSZ alone: inside a
+				// multiplexer the pane's pixel size comes from the host's
+				// XTWINOPS answer, and tuios answers per pane.
 				os.Stdout.WriteString("\x1b[16t\x1b[14t")
 				go func() {
 					time.Sleep(150 * time.Millisecond)
 					comp.mu.Lock()
+					was := fmt.Sprintf("%dx%d", comp.widthPx, comp.heightPx)
 					computeSize(comp, p)
+					now := fmt.Sprintf("%dx%d", comp.widthPx, comp.heightPx)
+					if was != now {
+						logf("SIGWINCH: pane %s -> %s px, reconfiguring the toplevel", was, now)
+					} else {
+						logf("SIGWINCH: pane still %s px", now)
+					}
 					comp.relayout()
 					comp.mu.Unlock()
 				}()
@@ -617,4 +623,41 @@ func orNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// muxEnv names the variables a terminal multiplexer exports into every pane.
+// Their presence is what tells us the terminal answering our probes is not
+// the terminal that will finally draw the pixels.
+//
+// tuios is listed twice because it has two of them: TUIOS_WINDOW_ID from the
+// in-process path and TUIOS_SESSION from the daemon. Nothing else about a
+// tuios pane gives it away -- TERM is inherited from the host, and
+// TERM_PROGRAM is deliberately set to "ghostty" so that guests will use kitty
+// graphics.
+var muxEnv = []string{"TUIOS_WINDOW_ID", "TUIOS_SESSION", "TMUX", "ZELLIJ", "STY"}
+
+// pickTransport chooses a kitty transport, and returns why.
+//
+// The rule that matters is the multiplexer check, and it exists because the
+// obvious heuristic is wrong. Delta mode patches an image in place with kitty
+// animation frames (a=f), which is the difference between 81 bytes and a
+// couple of megabytes per small update -- but tuios's vt acknowledges a=f and
+// drops it, so under tuios delta mode silently freezes rather than failing.
+//
+// The old check picked delta whenever TERM said kitty OR KITTY_WINDOW_ID was
+// set. Neither survives contact with a multiplexer: KITTY_WINDOW_ID is
+// inherited straight through, and tuios forwards the host's TERM into the
+// pane rather than replacing it. So `wlterm -- foot` in a tuios pane inside
+// kitty picked, on both counts, exactly the transport that cannot work there.
+// Only a positive multiplexer marker settles it.
+func pickTransport() (mode, why string) {
+	for _, k := range muxEnv {
+		if os.Getenv(k) != "" {
+			return "shm", "inside " + k + ", animation frames are not passed through"
+		}
+	}
+	if strings.Contains(os.Getenv("TERM"), "kitty") {
+		return "delta", "TERM says kitty"
+	}
+	return "shm", "shared memory is safe everywhere"
 }

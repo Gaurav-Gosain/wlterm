@@ -704,11 +704,15 @@ func statsLine(elapsed time.Duration) string {
 	fmt.Fprintf(&b, "fps=%.1f composite=%v encode=%v write=%v commit_to_out=%v ", float64(f)/secs, comp, enc, wr, lat)
 	fmt.Fprintf(&b, "pty_bytes_per_s=%d shm_bytes_per_s=%d ", int(float64(pty)/secs), int(float64(shm)/secs))
 	fmt.Fprintf(&b, "images_per_frame=%.2f dmg_px_per_frame=%d", float64(imgs)/float64(f), px/f)
+	// Every field here is one whitespace-free key=value, so the line stays
+	// parseable by splitting on spaces. dmabuf_sync is broken out because it
+	// is not compositor CPU: it is the implicit fence, i.e. the client's own
+	// render finishing, and only read-minus-sync is work we do.
 	if n := stats.shmCopies.Swap(0); n > 0 {
-		fmt.Fprintf(&b, " shm_read=%v/n=%d", time.Duration(stats.shmCopyNs.Swap(0)/n), n)
+		fmt.Fprintf(&b, " shm_read=%v shm_reads=%d", time.Duration(stats.shmCopyNs.Swap(0)/n), n)
 	}
 	if n := stats.dmaCopies.Swap(0); n > 0 {
-		fmt.Fprintf(&b, " dmabuf_read=%v(sync %v)/n=%d",
+		fmt.Fprintf(&b, " dmabuf_read=%v dmabuf_sync=%v dmabuf_reads=%d",
 			time.Duration(stats.dmaCopyNs.Swap(0)/n), time.Duration(stats.dmaSyncNs.Swap(0)/n), n)
 	}
 	if ops := stats.chromeOps.Swap(0); ops > 0 {
