@@ -22,6 +22,9 @@ border, the title and the focus ring, and already owns the leader key.
 - **No chrome.** wlterm draws no frame, no title, no focus ring, no dock. The
   client gets the pane exactly, in pixels, not quantised to whole cells: at a
   10x20 cell that is 1280x720 where the tiling mode would hand it 1260x640.
+  What is left of the chrome layer is one flood fill, run once per resize
+  rather than per frame, and it is the smaller half of the saving: the tile
+  covers the canvas, so the root image is composited but never transmitted.
 - **No leader key.** Every keystroke goes to the app. This is the concrete
   reason single-app exists: wlterm's leader was `ctrl+b` and so is tuios's, so
   inside a tuios pane the leader never arrived and nothing it guarded was
@@ -81,14 +84,19 @@ Measured in a real tuios pane at 980x440, same kitty, same workload, 30s
 
 | | llvmpipe via `wl_shm` | i915 via LINEAR dmabuf |
 |---|---|---|
-| fps | 50.9 | 51.1 |
-| client CPU | 58.0 s | **8.3 s** |
-| whole tree CPU | 73.3 s | **23.8 s** |
-| wlterm CPU | 4.29 s | 4.17 s |
-| compositor read | 226 us | 995 us (783 us of it the GPU fence, 212 us memcpy) |
+| fps | 49.5 | 49.6 |
+| kitty CPU | 57.6 s | **8.0 s** |
+| whole pane tree CPU | 73.2 s | **25.4 s** |
+| wlterm CPU | 4.7 s | 5.0 s |
+| composite | 2016 us | 2041 us |
+| compositor read | 285 us | 1097 us (775 us of it the GPU fence, 322 us memcpy) |
 
-Same frame rate, a seventh of the client's CPU. The compositor's own memcpy is
-the same either way, which is the whole point of the linear modifier.
+Same frame rate, a seventh of the client's CPU, and wlterm's own cost
+unchanged. The compositor's read looks worse until you split it: 775 us of it
+is `DMA_BUF_IOCTL_SYNC` waiting on the implicit fence, which is the client's
+render finishing rather than any work of ours. What we actually do is the
+`memcpy`, and that is the same size either way. That is the whole point of the
+linear modifier.
 
 **Vulkan needs no Vulkan-specific code.** `vkcube` renders through
 `VK_KHR_wayland_surface` on the Intel GPU and Mesa's WSI allocates a dmabuf
