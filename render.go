@@ -21,6 +21,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -486,6 +487,19 @@ func blitBGRAtoRGBA(dst []byte, dw, dh int, src []byte, sw, sh, ox, oy int, blen
 		srow := src[(sy*sw+(x0-ox))*4 : (sy*sw+(x1-ox))*4]
 		drow := dst[(dy*dw+x0)*4 : (dy*dw+x1)*4]
 		n := x1 - x0
+		if !blend {
+			// The opaque path is the whole cost of a full-pane frame, and it
+			// is a channel swap, not a copy: BGRA in, RGBA out. Doing it a
+			// byte at a time is four loads and four stores per pixel. One
+			// 32-bit load, a few shifts and one 32-bit store do the same
+			// swap, and the alpha is a constant.
+			for i := 0; i < n; i++ {
+				px := binary.LittleEndian.Uint32(srow[i*4 : i*4+4])
+				binary.LittleEndian.PutUint32(drow[i*4:i*4+4],
+					0xff000000|(px&0x0000ff)<<16|px&0x00ff00|px>>16&0x0000ff)
+			}
+			continue
+		}
 		for i := 0; i < n; i++ {
 			b, g, rr, a := srow[i*4], srow[i*4+1], srow[i*4+2], srow[i*4+3]
 			if !blend || a == 255 {

@@ -59,3 +59,30 @@ func TestLoopPacesAtTheTargetRateNotTheTargetGap(t *testing.T) {
 			1/((time.Second/fps + frameCost).Seconds()))
 	}
 }
+
+// The opaque blit was rewritten to move a pixel as one 32-bit word instead of
+// four bytes, because it is the whole cost of a full-pane frame. It has to
+// produce exactly what the byte-wise version produced.
+func TestOpaqueBlitMatchesTheBytewiseSwizzle(t *testing.T) {
+	const w, h = 37, 11 // deliberately not a multiple of anything
+	src := make([]byte, w*h*4)
+	for i := range src {
+		src[i] = byte(i*7 + i/3) // every channel takes many values, alpha included
+	}
+	want := make([]byte, w*h*4)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := (y*w + x) * 4
+			b, g, r := src[i], src[i+1], src[i+2]
+			want[i], want[i+1], want[i+2], want[i+3] = r, g, b, 255
+		}
+	}
+	got := make([]byte, w*h*4)
+	blitBGRAtoRGBA(got, w, h, src, w, h, 0, 0, false, rect{0, 0, w, h})
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("byte %d (pixel %d, channel %d): got %d want %d",
+				i, i/4, i%4, got[i], want[i])
+		}
+	}
+}
