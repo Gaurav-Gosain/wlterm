@@ -4,6 +4,9 @@ package main
 // callbacks allow and reports achieved fps. Workloads:
 //   -work full: whole surface repainted each frame
 //   -work rect: one 128x128 box moves (small damage)
+//   -work band: the top -damage percent of the surface is repainted and
+//               declared damaged, so the share of an image a frame changes
+//               can be swept from a sliver to the whole thing
 //   -work evil: declares a pool bigger than its file, then truncates a valid
 //               pool mid-stream (compositor hardening test)
 
@@ -77,7 +80,8 @@ const (
 func main() {
 	width := flag.Int("w", 1280, "width")
 	height := flag.Int("h", 720, "height")
-	work := flag.String("work", "full", "full|rect|idle|evil")
+	work := flag.String("work", "full", "full|rect|band|idle|evil")
+	damagePct := flag.Int("damage", 100, "percent of the surface repainted per frame (-work band)")
 	dur := flag.Int("dur", 10, "seconds to run")
 	flag.Parse()
 	W, H := *width, *height
@@ -168,6 +172,31 @@ func main() {
 			}
 			return
 		}
+		if *work == "band" {
+			// Everything is rewritten so the buffer never carries a stale
+			// half, but only the band changes value, and only the band is
+			// declared damaged below. What varies between runs is the share
+			// of the image one frame touches.
+			bandH := H * *damagePct / 100
+			if bandH < 1 {
+				bandH = 1
+			}
+			v := byte(n)
+			for y := 0; y < H; y++ {
+				c := byte(0x30)
+				if y < bandH {
+					c = v
+				}
+				row := y * W * 4
+				for x := 0; x < W; x++ {
+					px[row+x*4] = c
+					px[row+x*4+1] = byte(n >> 2)
+					px[row+x*4+2] = 0x40
+					px[row+x*4+3] = 0xff
+				}
+			}
+			return
+		}
 		if *work == "full" {
 			v := byte(n)
 			for i := 0; i < len(px); i += 4 {
@@ -201,7 +230,13 @@ func main() {
 			b = buf1
 		}
 		put(surfID, 1, b, int32(0), int32(0)) // attach
-		if *work == "rect" {
+		if *work == "band" {
+			bandH := int32(H * *damagePct / 100)
+			if bandH < 1 {
+				bandH = 1
+			}
+			put(surfID, 2, int32(0), int32(0), int32(W), bandH)
+		} else if *work == "rect" {
 			bx := int32((n * 7) % (W - 128))
 			by := int32((n * 3) % (H - 128))
 			pbx := int32(((n - 1) * 7) % (W - 128))
