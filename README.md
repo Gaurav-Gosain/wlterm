@@ -148,10 +148,10 @@ Measured in a real tuios pane at 980x440, same kitty, same workload, 30s
 
 | uncapped (`-fps 0`) | llvmpipe via `wl_shm` | i915 via LINEAR dmabuf |
 |---|---|---|
-| fps | 105.9 | **213.9** |
-| whole pane tree CPU | 129.2 s | **46.6 s** |
-| guest CPU | 105.3 s | **9.2 s** |
-| compositor read | 256 us | 904 us (676 us of it the GPU fence, 228 us memcpy) |
+| fps | 109.6 | **213.9** |
+| whole pane tree CPU | 144.4 s | **46.6 s** |
+| guest CPU | 119.7 s | **9.2 s** |
+| compositor read | 231 us | 904 us (676 us of it the GPU fence, 228 us memcpy) |
 
 Twice the frame rate on a third of the CPU.
 
@@ -170,10 +170,11 @@ render finishing rather than any work of ours. What we actually do is the
 `memcpy`, and that is the same size either way. That is the whole point of the
 linear modifier.
 
-At the default cap of 120 the i915 path is held by the cap (118.9 fps, 33.6 s
-of tree CPU) while llvmpipe is held by its own render cost, which is below the
-cap. The cap is doing what a cap should: bounding the fast path and staying
-out of the way of the slow one.
+At the default cap of 120 the i915 path is held by the cap: 118.9 fps for
+33.6 s of tree CPU. llvmpipe reaches 108.7 with the cap barely engaging at all
+(22 us of `pace` a frame), because its own render cost lands just under the
+cap. Which is what a cap should do: bound the fast path and stay out of the
+way of the slow one.
 
 **Vulkan needs no Vulkan-specific code.** `vkcube` renders through
 `VK_KHR_wayland_surface` on the Intel GPU and Mesa's WSI allocates a dmabuf
