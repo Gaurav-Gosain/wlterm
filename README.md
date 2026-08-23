@@ -87,20 +87,89 @@ wlterm has three ways to put pixels on your terminal, and `-mode auto`
 (the default) picks one:
 
 - `shm`: frames go into a small ring of `/dev/shm` files and the escape
-  carries a filename. Chosen whenever a multiplexer marker
-  (`TUIOS_WINDOW_ID`, `TUIOS_SESSION`, `TMUX`, `ZELLIJ`, `STY`) is in the
-  environment. The pty then carries about 70 bytes per frame and the pixels
-  ride tmpfs.
-- `delta`: kitty animation frames patch the previous image in place, which
-  is 81 bytes instead of megabytes for a small update. Chosen only when
-  `TERM` itself says kitty. A multiplexer's vt acknowledges animation
-  frames and drops them (tuios does), so delta mode under one freezes
-  silently.
-- `b64`: whole frames, base64, inline. Works anywhere kitty graphics work.
+  carries a filename. The pty carries about 80 bytes per frame and the
+  pixels ride tmpfs. Correct everywhere, and the fallback for everything
+  below.
+- `delta`: kitty animation frames (`a=f`) patch the image already on screen,
+  so only the damage moves. A small update is about 80 bytes of escape and a
+  rectangle of pixels instead of a whole frame.
+- `b64`: whole frames, base64, inline. Works anywhere kitty graphics work
+  and costs the most, megabytes down the pty per frame.
 
-The obvious heuristic (`KITTY_WINDOW_ID` set, or `TERM` inherited through a
-multiplexer) picks delta exactly where it cannot work, which is why only a
-positive multiplexer marker settles it.
+Whether delta is safe is the whole question, and the environment never
+answers it. `KITTY_WINDOW_ID` is inherited straight through a pane, and
+tuios forwards the host's `TERM` into it rather than replacing it, so both
+name the host terminal and neither says anything about the pane in front of
+it. The old heuristic read them and picked delta exactly where it could not
+work. So auto asks instead:
+
+- With no multiplexer, wlterm asks the terminal, with a probe a terminal
+  that gets frame edits wrong has to fail. It patches one pixel of a
+  four-pixel image and then checks the image is still four pixels wide, and
+  separately checks that a frame wider than the image is refused. A plain OK
+  is not enough to pass. kitty passes; ghostty and WezTerm answer neither
+  half, which is the right answer, because neither implements frame edits.
+- Inside tuios, wlterm asks tuios. tuios forwards a guest's `a=f` to its own
+  host and exports the result as `TUIOS_KITTY_ANIMATION`. It has to be asked
+  rather than probed, because tuios does not relay the host's reply back
+  into the pane: a guest that sends a frame edit and waits hears nothing
+  whether it worked or not. A tuios old enough not to set the variable gets
+  shm, which is what it got before.
+- Inside tmux, zellij or screen, shm. None of them carry frame edits.
+
+When auto chooses delta it keeps a ceiling of 200 frames a second whatever
+`-fps` asks for. An explicit `-mode delta` does not, so `-fps` stays the
+measured promise it is elsewhere.
+Frame edits are cheap enough to remove wlterm's own brake and nothing
+downstream supplies another one, so uncapped it outruns the terminal:
+measured against a software-rendered kitty at 700x350, 150 and 200 fps both
+kept the picture moving, 260 dropped more than half of it, and uncapped left
+the terminal presenting nothing at all for twenty seconds. The same workload
+in shm mode never gets there, because copying the frame is its own brake and
+it tops out near 130.
+
+### What the transports cost
+
+One guest (`wlbench`), one canvas, `-fps 60` for all of them so the CPU
+columns are measuring the same number of frames, twelve seconds each,
+`tools/afbench.py`. `rect` moves a 128x128 box; `full` repaints everything.
+`bare` is kitty directly at 1530x800; `tuios` is the same kitty with a tuios
+pane in between at 747x320, so the two blocks are only comparable within
+themselves.
+
+Inside a tuios pane:
+
+| transport | damage | pty B/frame | pixels/frame | wlterm CPU | tuios CPU | kitty CPU |
+|---|---|---|---|---|---|---|
+| shm | rect | 82 | 934 KB | 4.5 s | 2.1 s | 58.9 s |
+| delta | rect | 83 | **81 KB** | **3.8 s** | 2.1 s | 59.1 s |
+| b64 | rect | 1 277 739 | 0 | 5.8 s | 23.5 s | 61.6 s |
+| shm | full | 82 | 934 KB | 4.5 s | 2.1 s | 58.1 s |
+| delta | full | 80 | 934 KB | 4.5 s | 2.2 s | 59.5 s |
+| b64 | full | 1 277 926 | 0 | 6.0 s | 21.7 s | 58.8 s |
+
+Bare, for the same reading at a larger canvas: `rect` costs shm 4782 KB a
+frame and delta 110 KB; `full` costs both 4781 KB. b64 puts 6.5 MB a frame
+down the pty and cannot hold 60 fps at all, reaching 18. Inside the pane it
+reaches 44.
+
+Three things to read off this, and only the first is good news:
+
+- **Delta is worth it for small damage, and only for that.** It moves an
+  order of magnitude fewer pixels for a moving box, and a sixth less CPU in
+  wlterm. Grow the damage to the whole surface and every column matches shm,
+  because a whole-image frame edit is a whole image.
+- **The terminal does not get cheaper.** kitty burns the same CPU whichever
+  of the two it is given. The saving is in the pipe and in the compositor,
+  not at the far end, and it does not raise the frame rate: both hold the
+  cap.
+- **"81 bytes instead of megabytes" was delta against b64, not against
+  shm.** shm already puts about 80 bytes a frame on the pty. Against shm the
+  difference is where the pixels go, not how many bytes cross the wire.
+
+b64 is the row that makes the case for either of the others, and inside a
+pane it is also the row that costs tuios eleven times the CPU, because tuios
+has to diff and patch every whole bitmap it is handed.
 
 ## GPU clients
 
@@ -174,7 +243,7 @@ wire.
 | `-quit-key` | escape hatch, tapped twice; `none` intercepts nothing |
 | `-mode` | `auto` \| `delta` \| `shm` \| `b64` transport |
 | `-layers` | `per-window` \| `single` image granularity |
-| `-fps` | frame cap, `0` for uncapped (default 120) |
+| `-fps` | frame cap, `0` for uncapped (default 120; auto-chosen delta caps at 200) |
 | `-no-dmabuf` | do not advertise `zwp_linux_dmabuf_v1` |
 | `-drm NODE` | render node to advertise as dmabuf `main_device` |
 | `-prefix` | leader key, `-multi` only (default `ctrl+b`) |
@@ -213,6 +282,13 @@ wlterm crashed a desktop session once, early on. The rules come from that.
 - `kittydec/` decodes wlterm's own output stream back into PNGs to
   prove a frame actually rendered.
 - `wlbench/` is a minimal animating client for measuring the frame cap.
+  `-work band -damage PCT` sweeps the share of the image one frame changes.
+- `tools/tuios_host.py` runs tuios on a pty inside a real terminal and
+  relays both directions, so tuios probes the real host and its graphics
+  passthrough reaches the real host's decoder. `tools/tuios_pane.py` is the
+  other half of the pair: it makes the pane real and the host fake.
+- `tools/afbench.py` runs the transports against a real kitty, bare and
+  under tuios, and prints what each one costs.
 - `-snapshots DIR` writes composited PNGs straight out of the canvas.
 
 ## Known gaps
