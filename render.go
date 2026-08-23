@@ -99,9 +99,14 @@ func (r *renderer) loop() {
 			stats.paceNs.Add(uint64(d))
 		}
 		start := time.Now()
-		// Deliberately not next.Add(minInterval): a frame that overran its
-		// slot must not be repaid by firing the next ones back to back.
-		next = start.Add(minInterval)
+		// Advance the deadline on its own grid, so a Sleep that overshoots by
+		// the scheduler's granularity is absorbed by the next slot instead of
+		// accumulating as lost rate. Resync when we are more than a slot late,
+		// so a long stall is never repaid as a burst of back-to-back frames.
+		next = next.Add(minInterval)
+		if next.Before(start) {
+			next = start.Add(minInterval)
+		}
 		r.frame()
 		prevEnd = time.Now()
 	}
