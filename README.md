@@ -1,196 +1,170 @@
 # wlterm
 
-A Wayland compositor that lives inside a terminal pane. Clients render into
-`wl_shm` or a LINEAR `dmabuf`; wlterm composites them and writes the pixels to
-its own stdout as kitty graphics. Keyboard and mouse escape sequences flow the
-other way and become `wl_keyboard` and `wl_pointer` events.
+A Wayland compositor that runs inside a terminal.
+
+wlterm binds its own Wayland socket and real clients connect to it: foot,
+kitty, Thunar, vkcube. They render into shared memory or a linear dmabuf.
+wlterm composites the frames and writes the pixels to its own stdout as
+kitty graphics escapes, so your terminal draws them. Keyboard and mouse
+escapes flow the other way and come back out as `wl_keyboard` and
+`wl_pointer` events.
 
 Pure Go. No cgo, no libwayland, no wlroots, no EGL. The wire protocol is
 hand-implemented.
 
+![kitty and tuios running inside a wlterm pane, and a second wlterm running a second kitty and tuios inside that](assets/turtles.gif)
+
+This recording is one terminal. wlterm is compositing a kitty that runs
+tuios. Inside that tuios pane, `./inner.sh` starts a second wlterm, which
+composites a second kitty running a second tuios. Every level is a real
+compositor presenting to a real terminal.
+
+## Try it
+
 ```sh
 go build -o wlterm .
-./wlterm -- foot          # a Wayland terminal in your terminal
+./wlterm -- foot            # a Wayland terminal inside your terminal
+./wlterm -- vkcube          # Vulkan, inside your terminal
+./wlterm -multi -- foot     # a tiling compositor with a dock and a launcher
 ```
+
+You need a terminal that renders kitty graphics: kitty, ghostty, WezTerm.
+Inside a multiplexer, the pane works when the host terminal underneath
+supports them and the multiplexer passes them through; tuios does.
+
+## How it works
+
+```mermaid
+flowchart LR
+    C["Wayland client<br>(foot, Thunar, vkcube)"] -- "wl_shm / linear dmabuf" --> W["wlterm<br>(compositor, pure Go)"]
+    W -- "kitty graphics on stdout" --> T["host terminal<br>(kitty, ghostty, tuios pane)"]
+    T -- "key and mouse escapes on stdin" --> W
+    W -- "wl_keyboard / wl_pointer" --> C
+```
+
+- wlterm listens on its own socket (`wlterm-<pid>` under a private runtime
+  dir). It never dials or advertises the host session's `WAYLAND_DISPLAY`.
+- At startup it probes the terminal for the pane's size in pixels and cells,
+  and re-probes on `SIGWINCH`, so clients always see the pane's real
+  geometry.
+- Client buffers reach wlterm as plain memory: `wl_shm` pools are mmapped,
+  and dmabufs are restricted to `DRM_FORMAT_MOD_LINEAR` so reading them back
+  is the same `mmap` and `memcpy`. No GPU readback path exists or is needed.
 
 ## Single-app mode (the default)
 
-One toplevel, filling the pane, and nothing else. It is the mode for running a
-Wayland program inside a multiplexer, because a multiplexer already draws the
-border, the title and the focus ring, and already owns the leader key.
+One toplevel, filling the pane, and nothing else. This is the mode for
+running a Wayland program inside a multiplexer, because the multiplexer
+already draws the border and the title and already owns the leader key.
 
-- **No chrome.** wlterm draws no frame, no title, no focus ring, no dock. The
-  client gets the pane exactly, in pixels, not quantised to whole cells: at a
-  10x20 cell that is 1280x720 where the tiling mode would hand it 1260x640.
-  What is left of the chrome layer is one flood fill, run once per resize
-  rather than per frame, and it is the smaller half of the saving: the tile
-  covers the canvas, so the root image is composited but never transmitted.
-- **No leader key.** Every keystroke goes to the app. This is the concrete
-  reason single-app exists: wlterm's leader was `ctrl+b` and so is tuios's, so
-  inside a tuios pane the leader never arrived and nothing it guarded was
-  reachable.
-- **Resizes with the pane.** `SIGWINCH` re-probes the host for the pane's pixel
-  geometry and reconfigures the toplevel to match.
-- **Exits when the app exits**, and on `SIGHUP`/`SIGTERM`, so closing the pane
-  closes it.
+- No chrome. wlterm draws no frame, no title, no dock. The client gets the
+  pane's exact pixel size; tiling mode would round it to whole cells.
+- No leader key. Every keystroke goes to the app.
+- Resizes with the pane, exits when the app exits, and exits on
+  `SIGHUP`/`SIGTERM`, so closing the pane closes it.
 
-The escape hatch is `ctrl+\` **tapped twice inside 700ms**. A single press
-still reaches the app, and tuios does not bind it. `-quit-key none` intercepts
-nothing at all; `-quit-key ctrl+q` picks something else.
+The escape hatch is `ctrl+\` tapped twice inside 700ms. A single press still
+reaches the app. `-quit-key ctrl+q` picks a different key; `-quit-key none`
+intercepts nothing.
 
-### The transport picks itself, and being inside a multiplexer is the deciding fact
+## Multi mode
 
-`-mode auto` picks `shm` whenever a multiplexer marker (`TUIOS_SESSION`,
-`TMUX`, `ZELLIJ`, `STY`) is in the environment, and `delta` only when `TERM`
-itself says kitty.
+`-multi` turns on the tiling compositor: BSP and master-stack layouts, a
+frame and title per window, a dock, a leader key (`-prefix`, default
+`ctrl+b`), and an application launcher.
 
-Delta mode patches an image in place with kitty animation frames, which is 81
-bytes instead of megabytes for a small update, but tuios's vt acknowledges
-`a=f` and drops it, so under tuios delta mode freezes silently rather than
-failing. The heuristic this replaces also keyed off `KITTY_WINDOW_ID` -- and
-that variable is inherited straight through a multiplexer while `TERM` is
-rewritten, so `wlterm -- foot` in a tuios pane inside kitty used to pick
-exactly the transport that cannot work there.
+![two foot terminals tiled, the launcher opening, and Thunar launching into the layout](assets/multi.gif)
 
-Inside tuios `shm` costs nothing anyway: the pty carries a ~70 byte escape per
-frame (measured at 245 B/s with an idle client) while the pixels ride tmpfs.
+The launcher (`ctrl+b d`) fuzzy-matches over the system's desktop entries
+and ranks them by use. Launched GUI apps are verified against the
+framebuffer: if a window never appears, the log says so.
 
-## Multi-surface mode
+![the launcher overlay listing desktop entries over two tiled terminals](assets/launcher.png)
 
-`-multi` restores the tiling compositor: BSP and master-stack layouts, a
-tuios-shaped frame per window, a dock, a leader key (`-prefix`, default
-`ctrl+b`) and an application launcher over desktop entries with frecency.
+## Transports
 
-```sh
-./wlterm -multi -- foot
-```
+wlterm has three ways to put pixels on your terminal, and `-mode auto`
+(the default) picks one:
 
-Nothing about it was deleted to make single-app the default.
+- `shm`: frames go into a small ring of `/dev/shm` files and the escape
+  carries a filename. Chosen whenever a multiplexer marker
+  (`TUIOS_WINDOW_ID`, `TUIOS_SESSION`, `TMUX`, `ZELLIJ`, `STY`) is in the
+  environment. The pty then carries about 70 bytes per frame and the pixels
+  ride tmpfs.
+- `delta`: kitty animation frames patch the previous image in place, which
+  is 81 bytes instead of megabytes for a small update. Chosen only when
+  `TERM` itself says kitty. A multiplexer's vt acknowledges animation
+  frames and drops them (tuios does), so delta mode under one freezes
+  silently.
+- `b64`: whole frames, base64, inline. Works anywhere kitty graphics work.
 
-## The frame cap, and why it read 49
+The obvious heuristic (`KITTY_WINDOW_ID` set, or `TERM` inherited through a
+multiplexer) picks delta exactly where it cannot work, which is why only a
+positive multiplexer marker settles it.
 
-`-fps` names a rate. It did not used to deliver one.
+## GPU clients
 
-The render loop slept the cap interval measured from the **end** of the
-previous frame, so every period came out as the interval *plus* a whole
-frame's cost. With a 5ms frame, `-fps 60` produced 21.7ms periods: a cap of
-60 delivering 46. On top of that, every frame left one spare token in the
-render channel -- a commit calls `markDirty` for its damage and again for the
-frame callback it owes -- and the loop paid a full interval for that token
-before discovering there was nothing to draw. Two independent leaks, both
-paid once per frame.
+![vkcube spinning inside a terminal](assets/vkcube.gif)
 
-It hid because every benchmark here ran `-fps 1000`, where the interval is
-1ms and the frame cost swamps the error. Only `run_pane.sh` used the default,
-and that is the run that reported 49.
+That cube is Vulkan on the Intel GPU, presented through
+`zwp_linux_dmabuf_v1`. wlterm advertises exactly one modifier,
+`DRM_FORMAT_MOD_LINEAR`. A linear buffer on an integrated GPU is ordinary
+cacheable system memory, so compositing it costs one `memcpy` and no EGL
+context anywhere. Buffers with any other modifier are refused and clients
+fall back to `wl_shm`.
 
-The cap is now honoured to the tenth. Headless, 1280x720, `wl_shm`,
-`wlbench -work full`:
+Vulkan needs no Vulkan-specific code: Mesa's WSI allocates a dmabuf like any
+other client, and LINEAR is the only offer on the table.
 
-| `-fps` | before | after |
+Measured inside a real tuios pane at 980x440, kitty rendering the same
+workload for 30s, uncapped (`./run_pane.sh`):
+
+|  | llvmpipe via `wl_shm` | i915 via linear dmabuf |
 |---|---|---|
-| 30 | 22.5 | **30.0** |
-| 60 | 45.8 | **60.0** |
-| 120 | 73.3 | **120.0** |
-| 1000 | 164.4 | **190.7** |
-
-`stats:` grew `pace=` and `idle=` for this, so `composite + encode + write +
-pace + idle` now accounts for the whole period and a disappointing frame rate
-can be attributed instead of guessed at: `idle` is the guest rendering,
-`pace` is our own cap. `empty_wakes=` counts the tokens that had nothing
-behind them.
-
-**The default is 120, not 60.** Sixty is a monitor's number and nothing in
-this chain is a monitor. tuios coalesces a pane no faster than every 8ms
-(125fps) and kitty repaints no faster than its `repaint_delay` (10ms, 100fps),
-so a cap of 60 was throwing away half the smoothness the host would have
-displayed. `-fps 0` is uncapped.
-
-### Where a frame's time goes
-
-Uncapped in a tuios pane at 980x440, kitty on the i915 through a LINEAR
-dmabuf, 213.9 fps, so 4895 us a frame:
-
-| stage | | |
-|---|---|---|
-| `idle` | 2646 us | the guest rendering, and our readback of what it drew |
-| `composite` | 1489 us | blending the tile onto the canvas |
-| `encode` | 740 us | the pixels into a `/dev/shm` slot |
-| `write` | 19 us | ~46 bytes of kitty graphics escape down the pty |
-
-wlterm's own share is 2248 us, so the compositor alone would run at about
-445fps. The guest is what it waits for, which is the right answer: a
-compositor should be cheaper than the thing it is compositing.
-
-**Nothing downstream throttles this.** Counting the escapes tuios forwards to
-the host terminal (`tuios_pane.py --host-rate`) gives exactly two per frame at
-every rate tried -- 120.0/s at 60fps, 237.9/s at 118.9fps, 431.2/s at
-213.9fps -- for 0.01 to 0.03 MB/s. In `shm` mode the pixels ride tmpfs and
-what crosses the pty is a filename, so tuios's coalescer never sees a backlog
-worth pacing and its graphics pacer never sees a frame worth holding. That is
-what the transport was for, and it is why `-mode shm` is chosen inside a
-multiplexer.
-
-## dmabuf, and what the GPU is worth
-
-wlterm's output is kitty graphics, so every frame has to reach system memory to
-be encoded no matter how it was drawn. GPU rendering only pays if getting the
-pixels back is cheap.
-
-So wlterm advertises `zwp_linux_dmabuf_v1` with exactly one modifier:
-`DRM_FORMAT_MOD_LINEAR`. A linear dmabuf on an integrated GPU is ordinary
-cacheable system memory, so the readback is the same `mmap` and `memcpy` that
-`wl_shm` already used. No EGL context, no `glReadPixels`, no GPU-to-CPU
-readback path at all. Buffers that are not linear are refused.
-
-Measured in a real tuios pane at 980x440, same kitty, same workload, 30s
-(`./run_pane.sh`):
-
-| uncapped (`-fps 0`) | llvmpipe via `wl_shm` | i915 via LINEAR dmabuf |
-|---|---|---|
-| fps | 109.6 | **213.9** |
-| whole pane tree CPU | 144.4 s | **46.6 s** |
-| guest CPU | 119.7 s | **9.2 s** |
-| compositor read | 231 us | 904 us (676 us of it the GPU fence, 228 us memcpy) |
+| fps | 109.6 | 213.9 |
+| pane process tree CPU | 144.4 s | 46.6 s |
+| guest CPU | 119.7 s | 9.2 s |
 
 Twice the frame rate on a third of the CPU.
 
-That is not what this table used to say. It used to report 49.5 against 49.6
--- *the same frame rate* -- and conclude that the GPU bought CPU and nothing
-else. The frame rates were equal because both were pinned by wlterm's own
-broken frame cap, which sat at 49 whatever was underneath it. The guest was
-rendering inside our sleep, so making the guest seven times cheaper moved
-nothing. Fix the cap and the GPU is worth exactly what you would expect it to
-be worth. **A benchmark where two very different configurations agree to
-three significant figures is measuring the harness, not the subject.**
+The render node matters. wlterm prefers a node whose driver hands out
+CPU-cacheable buffers (`i915`, `xe`, `amdgpu`) and warns when the first
+large read runs below 1 GB/s. NVIDIA is a hard no: on this machine the
+nvidia node mmaps fine and then reads at 0.015 GB/s, which is 242ms for one
+720p frame. `-drm NODE` overrides the choice; `-no-dmabuf` turns the
+protocol off.
 
-The compositor's read looks worse until you split it: 676 us of it is
-`DMA_BUF_IOCTL_SYNC` waiting on the implicit fence, which is the client's
-render finishing rather than any work of ours. What we actually do is the
-`memcpy`, and that is the same size either way. That is the whole point of the
-linear modifier.
+## Performance
 
-At the default cap of 120 the i915 path is held by the cap: 118.9 fps for
-33.6 s of tree CPU. llvmpipe reaches 108.7 with the cap barely engaging at all
-(22 us of `pace` a frame), because its own render cost lands just under the
-cap. Which is what a cap should do: bound the fast path and stay out of the
-way of the slow one.
+The frame cap defaults to 120, and `-fps 0` uncaps. Sixty is a monitor's
+number and nothing in this chain is a monitor: tuios coalesces a pane about
+every 8ms and kitty repaints at its 10ms `repaint_delay`, so a cap of 60
+throws away smoothness the host would have displayed.
 
-**Vulkan needs no Vulkan-specific code.** `vkcube` renders through
-`VK_KHR_wayland_surface` on the Intel GPU and Mesa's WSI allocates a dmabuf
-like everything else; LINEAR is all wlterm offers, so it allocates linear.
+The cap is honoured to the tenth of a frame. It once was not: the loop
+paced on the gap after each frame instead of on a rate, so `-fps 60`
+delivered 46, and the number was invisible because every benchmark ran at
+`-fps 1000` where the error drowns. `wlbench/` exists so that `-fps N` is a
+measured promise: run it and N has to come back.
 
-### The render node matters more than anything else here
+Where a frame goes, uncapped in a tuios pane at 980x440 on the i915
+(213.9 fps):
 
-wlterm prefers a node whose driver is known to hand out CPU-cacheable buffers
-(`i915`, `xe`, `amdgpu`, ...) and warns loudly when the first large read runs
-below 1 GB/s.
+| stage | time | what it is |
+|---|---|---|
+| idle | 2646 us | the guest rendering; wlterm waiting |
+| composite | 1489 us | blending the tile onto the canvas |
+| encode | 740 us | pixels into a `/dev/shm` slot |
+| write | 19 us | ~46 bytes of escape down the pty |
 
-**NVIDIA is a hard no.** On the machine this was built on, `renderD128`
-(nvidia) `mmap`s successfully and then reads at 0.015 GB/s: 242 ms for one
-1280x720 frame. A compositor that accepts such a buffer looks hung rather than
-broken. `-drm NODE` overrides the choice; `-no-dmabuf` forces clients back onto
-`wl_shm`.
+The compositor's own work is 2.2ms per frame. The guest is what it waits
+for, which is the right shape: a compositor should be cheaper than the
+thing it composites.
+
+Nothing downstream throttles this. Counting the escapes tuios forwards to
+the host terminal gives exactly two per frame at every rate tried, for 0.01
+to 0.03 MB/s on the pty. The pixels ride tmpfs; only filenames cross the
+wire.
 
 ## Flags
 
@@ -203,43 +177,45 @@ broken. `-drm NODE` overrides the choice; `-no-dmabuf` forces clients back onto
 | `-fps` | frame cap, `0` for uncapped (default 120) |
 | `-no-dmabuf` | do not advertise `zwp_linux_dmabuf_v1` |
 | `-drm NODE` | render node to advertise as dmabuf `main_device` |
-| `-prefix` | leader key, `-multi` only |
+| `-prefix` | leader key, `-multi` only (default `ctrl+b`) |
 | `-spawn` / `-term` | commands the launcher uses, `-multi` only |
 | `-exec CMD` | extra client at startup, repeatable |
 | `-isolate` | private runtime dir and session bus per child (default on) |
 | `-pixels` / `-cell` | headless: no tty setup, fixed canvas |
-| `-snapshots` | write composited PNGs for verification |
+| `-snapshots DIR` | write composited PNGs for verification |
 
 ## Safety
 
-wlterm crashed a desktop session once, and the rules come from that.
+wlterm crashed a desktop session once, early on. The rules come from that.
 
-- It binds **its own** socket under a private runtime dir and never dials or
-  inherits the host's `WAYLAND_DISPLAY`.
-- Children get a private `XDG_RUNTIME_DIR` and a private session bus. Stripping
-  `WAYLAND_DISPLAY` alone is not enough: most GTK and KDE apps are launched
-  through the bus, which routes the request to the copy already running on the
-  host desktop, opens a window there, and exits 0 looking like a success.
-- Client buffers are treated as hostile. `wl_shm` pools and dmabuf fds are
-  `fstat`-validated before mapping, buffers are bounds-checked, and reads run
-  under `debug.SetPanicOnFault` because a client can truncate after validation.
-- Outbound frames use a fixed 8-slot ring of `/dev/shm` names, unlinked on
-  reuse and on every exit path, so a terminal that never unlinks (tuios does
-  not) cannot make us leak tmpfs at frame rate.
-- Every resource-owning object is swept when a client disconnects.
+- The socket is wlterm's own, under a private runtime dir. The host
+  session's `WAYLAND_DISPLAY` is never inherited by children and never
+  dialed.
+- Children get a private `XDG_RUNTIME_DIR` and a private session bus.
+  Stripping `WAYLAND_DISPLAY` alone is not enough: GTK and KDE apps launch
+  through the session bus, which routes the request to the copy already
+  running on the host desktop, opens a window there, and exits 0 looking
+  like a success.
+- Client buffers are treated as hostile. Pools and dmabuf fds are validated
+  before mapping, reads are bounds-checked and run under
+  `debug.SetPanicOnFault`, because a client can truncate a pool after
+  validation.
+- Outbound frames use a fixed 8-slot ring of `/dev/shm` files, unlinked on
+  reuse and on every exit path, so a terminal that never unlinks cannot
+  make wlterm leak tmpfs at frame rate.
 
 ## Verifying
 
-- `./run_pane.sh` -- everything above, inside a real tuios pane.
-- `./run_safety.sh`, `dmaevil/` -- hostile clients. Every case must end with
-  the client refused and the compositor alive.
-- `kittydec/` -- decodes wlterm's own output stream back into PNGs, which is
-  how "it rendered" is checked rather than assumed.
-- `wlbench/` -- a minimal animating Wayland client. `-fps N` against it is how
-  the frame cap is checked: it has to come back as N.
-- `-snapshots DIR` -- composited PNGs straight out of the canvas.
+- `./run_pane.sh` runs everything inside a real tuios pane and prints the
+  numbers above.
+- `./run_safety.sh` and `dmaevil/` throw hostile clients at the compositor.
+  Every case must end with the client refused and the compositor alive.
+- `kittydec/` decodes wlterm's own output stream back into PNGs to
+  prove a frame actually rendered.
+- `wlbench/` is a minimal animating client for measuring the frame cap.
+- `-snapshots DIR` writes composited PNGs straight out of the canvas.
 
 ## Known gaps
 
-Client cursors are dropped, so the pointer works but is invisible. `xdg_popup`
-is accepted but menus are drawn nowhere. Clipboard is a stub.
+Client cursors are dropped, so the pointer works but is invisible. The
+clipboard is a stub. The keyboard map is US layout only.
