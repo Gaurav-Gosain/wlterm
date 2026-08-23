@@ -31,6 +31,10 @@ ap.add_argument('--cap-mb', type=int, default=32)
 ap.add_argument('--resize-at', type=float, default=0)
 ap.add_argument('--resize-to', default='')
 ap.add_argument('--cpu-out', default='', help='sum CPU seconds over the pane process tree')
+ap.add_argument('--host-rate', default='',
+                help='count kitty graphics escapes leaving tuios for the host '
+                     'terminal, per second, without storing the bytes. This is '
+                     'the far end of the chain: what the human would see.')
 ap.add_argument('--post', action='append', default=[],
                 help='SECONDS@BYTES, sent at that offset from the start of the '
                      'run; BYTES honours \\x and \\r escapes. Repeatable.')
@@ -134,6 +138,13 @@ cpu_peak = {}
 
 cap = a.cap_mb * 1024 * 1024
 written = 0
+# Per-second buckets of (kitty graphics escapes, bytes) on tuios's own output.
+# Counted in flight and thrown away, because a 30s capture of this stream is
+# hundreds of megabytes and the only thing wanted from it is a rate.
+host_buckets = []
+host_esc = host_bytes = 0
+host_sec = 0
+host_carry = b''
 t0 = time.time()
 typed = resized = False
 pre_sent = 0
@@ -182,9 +193,22 @@ try:
         if out and written < cap:
             out.write(data[:cap - written])
         written += len(data)
+        if a.host_rate:
+            scan = host_carry + data
+            host_esc += scan.count(b'\x1b_G')
+            host_carry = scan[-2:]
+            host_bytes += len(data)
+            while now >= host_sec + 1:
+                host_buckets.append((host_sec, host_esc, host_bytes))
+                host_esc = host_bytes = 0
+                host_sec += 1
 finally:
     if out:
         out.close()
+    if a.host_rate:
+        with open(a.host_rate, 'w') as f:
+            for t, e, b in host_buckets:
+                f.write(f'{t}\t{e}\t{b}\n')
     os.write(mfd, b'\x02q')
     time.sleep(0.5)
     for sig in (signal.SIGTERM, signal.SIGKILL):
