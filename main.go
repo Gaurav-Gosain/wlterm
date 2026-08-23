@@ -56,7 +56,7 @@ func main() {
 	autoWhy := "explicit"
 
 	layers := flag.String("layers", "per-window", "granularity: per-window|single")
-	fps := flag.Int("fps", 60, "max frames per second")
+	fps := flag.Int("fps", 120, "max frames per second, 0 for uncapped")
 	logPath := flag.String("log", "", "debug log file")
 	pixels := flag.String("pixels", "", "WxH: headless mode, no tty setup")
 	cellSize := flag.String("cell", "10x20", "headless cell size WxH")

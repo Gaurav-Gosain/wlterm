@@ -67,6 +67,70 @@ tuios-shaped frame per window, a dock, a leader key (`-prefix`, default
 
 Nothing about it was deleted to make single-app the default.
 
+## The frame cap, and why it read 49
+
+`-fps` names a rate. It did not used to deliver one.
+
+The render loop slept the cap interval measured from the **end** of the
+previous frame, so every period came out as the interval *plus* a whole
+frame's cost. With a 5ms frame, `-fps 60` produced 21.7ms periods: a cap of
+60 delivering 46. On top of that, every frame left one spare token in the
+render channel -- a commit calls `markDirty` for its damage and again for the
+frame callback it owes -- and the loop paid a full interval for that token
+before discovering there was nothing to draw. Two independent leaks, both
+paid once per frame.
+
+It hid because every benchmark here ran `-fps 1000`, where the interval is
+1ms and the frame cost swamps the error. Only `run_pane.sh` used the default,
+and that is the run that reported 49.
+
+The cap is now honoured to the tenth. Headless, 1280x720, `wl_shm`,
+`wlbench -work full`:
+
+| `-fps` | before | after |
+|---|---|---|
+| 30 | 22.5 | **30.0** |
+| 60 | 45.8 | **60.0** |
+| 120 | 73.3 | **120.0** |
+| 1000 | 164.4 | **190.7** |
+
+`stats:` grew `pace=` and `idle=` for this, so `composite + encode + write +
+pace + idle` now accounts for the whole period and a disappointing frame rate
+can be attributed instead of guessed at: `idle` is the guest rendering,
+`pace` is our own cap. `empty_wakes=` counts the tokens that had nothing
+behind them.
+
+**The default is 120, not 60.** Sixty is a monitor's number and nothing in
+this chain is a monitor. tuios coalesces a pane no faster than every 8ms
+(125fps) and kitty repaints no faster than its `repaint_delay` (10ms, 100fps),
+so a cap of 60 was throwing away half the smoothness the host would have
+displayed. `-fps 0` is uncapped.
+
+### Where a frame's time goes
+
+Uncapped in a tuios pane at 980x440, kitty on the i915 through a LINEAR
+dmabuf, 213.9 fps, so 4895 us a frame:
+
+| stage | | |
+|---|---|---|
+| `idle` | 2646 us | the guest rendering, and our readback of what it drew |
+| `composite` | 1489 us | blending the tile onto the canvas |
+| `encode` | 740 us | the pixels into a `/dev/shm` slot |
+| `write` | 19 us | ~46 bytes of kitty graphics escape down the pty |
+
+wlterm's own share is 2248 us, so the compositor alone would run at about
+445fps. The guest is what it waits for, which is the right answer: a
+compositor should be cheaper than the thing it is compositing.
+
+**Nothing downstream throttles this.** Counting the escapes tuios forwards to
+the host terminal (`tuios_pane.py --host-rate`) gives exactly two per frame at
+every rate tried -- 120.0/s at 60fps, 237.9/s at 118.9fps, 431.2/s at
+213.9fps -- for 0.01 to 0.03 MB/s. In `shm` mode the pixels ride tmpfs and
+what crosses the pty is a filename, so tuios's coalescer never sees a backlog
+worth pacing and its graphics pacer never sees a frame worth holding. That is
+what the transport was for, and it is why `-mode shm` is chosen inside a
+multiplexer.
+
 ## dmabuf, and what the GPU is worth
 
 wlterm's output is kitty graphics, so every frame has to reach system memory to
@@ -82,21 +146,34 @@ readback path at all. Buffers that are not linear are refused.
 Measured in a real tuios pane at 980x440, same kitty, same workload, 30s
 (`./run_pane.sh`):
 
-| | llvmpipe via `wl_shm` | i915 via LINEAR dmabuf |
+| uncapped (`-fps 0`) | llvmpipe via `wl_shm` | i915 via LINEAR dmabuf |
 |---|---|---|
-| fps | 49.5 | 49.6 |
-| kitty CPU | 57.6 s | **8.0 s** |
-| whole pane tree CPU | 73.2 s | **25.4 s** |
-| wlterm CPU | 4.7 s | 5.0 s |
-| composite | 2016 us | 2041 us |
-| compositor read | 285 us | 1097 us (775 us of it the GPU fence, 322 us memcpy) |
+| fps | 105.9 | **213.9** |
+| whole pane tree CPU | 129.2 s | **46.6 s** |
+| guest CPU | 105.3 s | **9.2 s** |
+| compositor read | 256 us | 904 us (676 us of it the GPU fence, 228 us memcpy) |
 
-Same frame rate, a seventh of the client's CPU, and wlterm's own cost
-unchanged. The compositor's read looks worse until you split it: 775 us of it
-is `DMA_BUF_IOCTL_SYNC` waiting on the implicit fence, which is the client's
+Twice the frame rate on a third of the CPU.
+
+That is not what this table used to say. It used to report 49.5 against 49.6
+-- *the same frame rate* -- and conclude that the GPU bought CPU and nothing
+else. The frame rates were equal because both were pinned by wlterm's own
+broken frame cap, which sat at 49 whatever was underneath it. The guest was
+rendering inside our sleep, so making the guest seven times cheaper moved
+nothing. Fix the cap and the GPU is worth exactly what you would expect it to
+be worth. **A benchmark where two very different configurations agree to
+three significant figures is measuring the harness, not the subject.**
+
+The compositor's read looks worse until you split it: 676 us of it is
+`DMA_BUF_IOCTL_SYNC` waiting on the implicit fence, which is the client's
 render finishing rather than any work of ours. What we actually do is the
 `memcpy`, and that is the same size either way. That is the whole point of the
 linear modifier.
+
+At the default cap of 120 the i915 path is held by the cap (118.9 fps, 33.6 s
+of tree CPU) while llvmpipe is held by its own render cost, which is below the
+cap. The cap is doing what a cap should: bounding the fast path and staying
+out of the way of the slow one.
 
 **Vulkan needs no Vulkan-specific code.** `vkcube` renders through
 `VK_KHR_wayland_surface` on the Intel GPU and Mesa's WSI allocates a dmabuf
@@ -122,7 +199,7 @@ broken. `-drm NODE` overrides the choice; `-no-dmabuf` forces clients back onto
 | `-quit-key` | escape hatch, tapped twice; `none` intercepts nothing |
 | `-mode` | `auto` \| `delta` \| `shm` \| `b64` transport |
 | `-layers` | `per-window` \| `single` image granularity |
-| `-fps` | frame cap |
+| `-fps` | frame cap, `0` for uncapped (default 120) |
 | `-no-dmabuf` | do not advertise `zwp_linux_dmabuf_v1` |
 | `-drm NODE` | render node to advertise as dmabuf `main_device` |
 | `-prefix` | leader key, `-multi` only |
@@ -157,7 +234,8 @@ wlterm crashed a desktop session once, and the rules come from that.
   the client refused and the compositor alive.
 - `kittydec/` -- decodes wlterm's own output stream back into PNGs, which is
   how "it rendered" is checked rather than assumed.
-- `wlbench/` -- a minimal animating Wayland client.
+- `wlbench/` -- a minimal animating Wayland client. `-fps N` against it is how
+  the frame cap is checked: it has to come back as N.
 - `-snapshots DIR` -- composited PNGs straight out of the canvas.
 
 ## Known gaps
