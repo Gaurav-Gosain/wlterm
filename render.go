@@ -34,6 +34,8 @@ type renderStats struct {
 	compositeNs atomic.Uint64
 	encodeNs    atomic.Uint64
 	writeNs     atomic.Uint64
+	paceNs      atomic.Uint64
+	idleNs      atomic.Uint64
 	latencyNs   atomic.Uint64
 	ptyBytes    atomic.Uint64
 	shmBytes    atomic.Uint64
@@ -75,15 +77,33 @@ func newRenderer(comp *compositor, mode string, layered bool, out *os.File, maxF
 	return &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS}
 }
 
+// loop paces frames from the start of one to the start of the next, so
+// -fps is a rate rather than a gap between frames.
+//
+// It used to sleep minInterval measured from the *end* of the previous frame,
+// which adds a whole frame's cost to every period: with a 5ms frame, -fps 60
+// produced 21.7ms periods, i.e. 46fps. The error is invisible in a benchmark
+// run at -fps 1000, where minInterval is 1ms and the frame cost dominates
+// anyway, and that is exactly where wlterm's fast numbers were measured.
 func (r *renderer) loop() {
 	minInterval := time.Second / time.Duration(r.maxFPS)
-	last := time.Time{}
+	var next time.Time
+	var prevEnd time.Time
 	for range r.comp.renderCh {
-		if d := time.Since(last); d < minInterval {
-			time.Sleep(minInterval - d)
+		recv := time.Now()
+		if !prevEnd.IsZero() {
+			stats.idleNs.Add(uint64(recv.Sub(prevEnd)))
 		}
+		if d := next.Sub(recv); d > 0 {
+			time.Sleep(d)
+			stats.paceNs.Add(uint64(d))
+		}
+		start := time.Now()
+		// Deliberately not next.Add(minInterval): a frame that overran its
+		// slot must not be repaid by firing the next ones back to back.
+		next = start.Add(minInterval)
 		r.frame()
-		last = time.Now()
+		prevEnd = time.Now()
 	}
 }
 
@@ -701,7 +721,12 @@ func statsLine(elapsed time.Duration) string {
 	imgs := stats.images.Swap(0)
 	px := stats.dmgPixels.Swap(0)
 	var b strings.Builder
-	fmt.Fprintf(&b, "fps=%.1f composite=%v encode=%v write=%v commit_to_out=%v ", float64(f)/secs, comp, enc, wr, lat)
+	pace := time.Duration(stats.paceNs.Swap(0) / f)
+	idle := time.Duration(stats.idleNs.Swap(0) / f)
+	// composite+encode+write+pace+idle accounts for the whole period, so a
+	// frame rate that disappoints can be attributed rather than guessed at:
+	// idle is the guest rendering, pace is our own frame cap.
+	fmt.Fprintf(&b, "fps=%.1f composite=%v encode=%v write=%v pace=%v idle=%v commit_to_out=%v ", float64(f)/secs, comp, enc, wr, pace, idle, lat)
 	fmt.Fprintf(&b, "pty_bytes_per_s=%d shm_bytes_per_s=%d ", int(float64(pty)/secs), int(float64(shm)/secs))
 	fmt.Fprintf(&b, "images_per_frame=%.2f dmg_px_per_frame=%d", float64(imgs)/float64(f), px/f)
 	// Every field here is one whitespace-free key=value, so the line stays
