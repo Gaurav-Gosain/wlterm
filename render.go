@@ -66,13 +66,16 @@ type renderer struct {
 
 	rootSent  bool
 	rootDirty bool
-	blendLC   *launcher // single-canvas mode: overlay blended at emit time
-	layerSrc  *launcher // per-window mode: the image being emitted is a layer
-	rootDmg   rect
-	shmSeq    int
-	sub       []byte
-	b64buf    []byte
-	emitBuf   []byte
+	// patches counts frame edits sent for each image since it was last
+	// transmitted whole. See resyncAfterPatches.
+	patches  map[uint32]int
+	blendLC  *launcher // single-canvas mode: overlay blended at emit time
+	layerSrc *launcher // per-window mode: the image being emitted is a layer
+	rootDmg  rect
+	shmSeq   int
+	sub      []byte
+	b64buf   []byte
+	emitBuf  []byte
 
 	// frameFn is what loop() paces. Only a test replaces it, so that the
 	// pacing can be checked against a frame of known cost without a
@@ -81,7 +84,8 @@ type renderer struct {
 }
 
 func newRenderer(comp *compositor, mode string, layered bool, out *os.File, maxFPS int) *renderer {
-	r := &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS}
+	r := &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS,
+		patches: map[uint32]int{}}
 	r.frameFn = r.frame
 	return r
 }
@@ -529,6 +533,22 @@ func (r *renderer) emitImage(imgID uint32, area rect, dmg damageSet, col, row, z
 		return 0
 	}
 
+	// A run of frame edits is broken up by transmitting the image whole.
+	//
+	// A patch is a difference from pixels the host is holding, so it is only
+	// as good as the host's copy. A host that quietly dropped the image --
+	// kitty enforces a storage quota and will -- would otherwise be patched
+	// forever and show the last thing it had, because a frame edit naming an
+	// image that is gone is an error nobody here reads. One transmission
+	// restores the picture and costs a second's worth of nothing.
+	//
+	// At the default cap this is one whole frame a second, and a guest that is
+	// not repainting never reaches it: the count only advances on frames that
+	// actually changed something.
+	if r.mode == "delta" && !full && r.patches[kid] >= resyncAfterPatches {
+		full = true
+	}
+
 	if r.mode == "delta" && !full {
 		// Animation-frame edits: patch each damaged rectangle in place.
 		// Coordinates are relative to the image, so subtract its origin.
@@ -550,9 +570,11 @@ func (r *renderer) emitImage(imgID uint32, area rect, dmg damageSet, col, row, z
 				base64.StdEncoding.EncodeToString([]byte(name)))...)
 			sent += len(r.sub)
 		}
+		r.patches[kid]++
 		return sent
 	}
 
+	r.patches[kid] = 0
 	r.extract(area)
 	// Place the image at its cell. C=1 keeps the cursor where it was, so
 	// several placements can be emitted back to back.
@@ -657,6 +679,10 @@ func (r *renderer) emitLayer(lc *launcher, it emitItem) int {
 	defer func() { r.layerSrc = nil }()
 	return r.emitImage(it.imgID, it.area, it.dmg, it.col, it.row, it.z, it.full)
 }
+
+// resyncAfterPatches is how many frame edits an image may take before it is
+// transmitted whole again. One second of them at the default cap.
+const resyncAfterPatches = 120
 
 // shmRingSize bounds tmpfs usage: at most this many frame files exist at
 // once, even under a terminal that reads but never unlinks. With several

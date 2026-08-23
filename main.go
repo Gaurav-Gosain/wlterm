@@ -142,7 +142,31 @@ func main() {
 	}
 
 	if *mode == "auto" {
-		*mode, autoWhy = pickTransport()
+		*mode, autoWhy = pickTransport(p.frameEdits)
+	}
+	// Only the chosen-for-you path gets the ceiling. An explicit -mode delta
+	// is somebody who knows what the transport is, and -fps stays the measured
+	// promise it is documented to be for them.
+	if *mode == "delta" && autoWhy != "explicit" && (*fps == 0 || *fps > deltaMaxFPS) {
+		// Frame edits are cheap enough to remove wlterm's own brake, and
+		// nothing downstream supplies another one: wlterm never waits for the
+		// host, so a transport that costs nothing lets it run until the host
+		// has no CPU left.
+		//
+		// Measured on this machine, wlterm uncapped in delta mode against a
+		// software-rendered kitty: 150 and 200 frames a second both kept the
+		// picture moving, 260 dropped more than half of it, and uncapped -- 261
+		// achieved -- left the terminal presenting nothing at all for twenty
+		// seconds. The same workload in shm mode never got there, because
+		// copying the frame is its own brake and it tops out near 130.
+		//
+		// So delta keeps a ceiling even when asked not to. A picture the host
+		// cannot draw is not worth producing, and the whole point of the
+		// transport is that it does not need a high rate to look smooth.
+		logf("delta: capping at %d fps (asked for %s); frame edits are cheap "+
+			"enough to starve the terminal of the time it needs to draw them",
+			deltaMaxFPS, orUncapped(*fps))
+		*fps = deltaMaxFPS
 	}
 	kind := "single-app"
 	if *multi {
@@ -618,6 +642,18 @@ func fatal(format string, args ...any) {
 	os.Exit(1)
 }
 
+// deltaMaxFPS is the ceiling the delta transport keeps when -mode auto chose
+// it. See where it is applied for the measurements behind the number.
+const deltaMaxFPS = 200
+
+// orUncapped names a frame cap for a log line.
+func orUncapped(fps int) string {
+	if fps == 0 {
+		return "uncapped"
+	}
+	return strconv.Itoa(fps)
+}
+
 func orNone(s string) string {
 	if s == "" {
 		return "none"
@@ -629,35 +665,61 @@ func orNone(s string) string {
 // Their presence is what tells us the terminal answering our probes is not
 // the terminal that will finally draw the pixels.
 //
-// tuios is listed twice because it has two of them: TUIOS_WINDOW_ID from the
-// in-process path and TUIOS_SESSION from the daemon. Nothing else about a
-// tuios pane gives it away -- TERM is inherited from the host, and
-// TERM_PROGRAM is deliberately set to "ghostty" so that guests will use kitty
-// graphics.
-var muxEnv = []string{"TUIOS_WINDOW_ID", "TUIOS_SESSION", "TMUX", "ZELLIJ", "STY"}
+// tuios is not in this list. It is the one multiplexer that does carry frame
+// edits, and it says so itself; see pickTransport.
+var muxEnv = []string{"TMUX", "ZELLIJ", "STY"}
+
+// tuiosEnv names the variables tuios exports into every pane. There are two
+// because there are two paths: TUIOS_WINDOW_ID from the in-process one and
+// TUIOS_SESSION from the daemon. Nothing else about a tuios pane gives it
+// away -- TERM is inherited from the host, and TERM_PROGRAM is deliberately
+// set to "ghostty" so that guests will use kitty graphics.
+var tuiosEnv = []string{"TUIOS_WINDOW_ID", "TUIOS_SESSION"}
 
 // pickTransport chooses a kitty transport, and returns why.
 //
-// The rule that matters is the multiplexer check, and it exists because the
-// obvious heuristic is wrong. Delta mode patches an image in place with kitty
-// animation frames (a=f), which is the difference between 81 bytes and a
-// couple of megabytes per small update -- but tuios's vt acknowledges a=f and
-// drops it, so under tuios delta mode silently freezes rather than failing.
+// Delta mode patches an image in place with kitty animation frames (a=f),
+// which is the difference between 81 bytes and a couple of megabytes per small
+// update. The question is only ever whether the thing at the far end of the
+// pty applies them, and there are three ways to find out, in order of how much
+// they can be trusted:
 //
-// The old check picked delta whenever TERM said kitty OR KITTY_WINDOW_ID was
-// set. Neither survives contact with a multiplexer: KITTY_WINDOW_ID is
-// inherited straight through, and tuios forwards the host's TERM into the
-// pane rather than replacing it. So `wlterm -- foot` in a tuios pane inside
-// kitty picked, on both counts, exactly the transport that cannot work there.
-// Only a positive multiplexer marker settles it.
-func pickTransport() (mode, why string) {
+//   - Ask the terminal. frameEdits is the answer to a probe that a terminal
+//     which gets frame edits wrong has to fail, so a plain OK is not enough to
+//     pass it. This is the answer used whenever there is no multiplexer.
+//   - Ask the multiplexer. tuios forwards a guest's a=f to its own host and
+//     exports the result as TUIOS_KITTY_ANIMATION, so the pane can be asked
+//     what the pane carries. It has to be asked rather than probed, because
+//     tuios does not relay the host's reply back into the pane: a guest that
+//     sends a frame edit and waits hears nothing whether it worked or not.
+//   - Guess from the environment. This is what used to happen and it is
+//     wrong. KITTY_WINDOW_ID is inherited straight through a pane, and tuios
+//     forwards the host's TERM into it rather than replacing it, so both name
+//     the host terminal and neither says anything about the pane in front of
+//     it.
+//
+// Everything else -- tmux, zellij, screen, an unknown terminal, headless --
+// gets shared memory, which is correct everywhere.
+func pickTransport(frameEdits bool) (mode, why string) {
+	for _, k := range tuiosEnv {
+		if os.Getenv(k) == "" {
+			continue
+		}
+		switch os.Getenv("TUIOS_KITTY_ANIMATION") {
+		case "1":
+			return "delta", "tuios says this pane carries frame edits"
+		case "0":
+			return "shm", "tuios says this pane does not carry frame edits"
+		}
+		return "shm", "inside tuios, which did not say whether frame edits get through"
+	}
 	for _, k := range muxEnv {
 		if os.Getenv(k) != "" {
-			return "shm", "inside " + k + ", animation frames are not passed through"
+			return "shm", "inside " + k + ", frame edits are not passed through"
 		}
 	}
-	if strings.Contains(os.Getenv("TERM"), "kitty") {
-		return "delta", "TERM says kitty"
+	if frameEdits {
+		return "delta", "the terminal applied a test frame edit and refused a bad one"
 	}
 	return "shm", "shared memory is safe everywhere"
 }

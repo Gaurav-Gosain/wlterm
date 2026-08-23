@@ -6,6 +6,7 @@ package main
 // press+release pairs.
 
 import (
+	"bytes"
 	"os"
 	"strconv"
 	"strings"
@@ -47,6 +48,24 @@ type inputParser struct {
 	gotCell      chan struct{}
 	decrqm1016   chan bool
 	kittyKBProbe chan bool
+	gfxAnswers   chan gfxAnswer
+	// da1 fires on the DA1 reply, which is asked for last and so closes the
+	// probe window. It is separate from kittyKBProbe because the kitty
+	// keyboard reply arrives first and ending the window there would throw
+	// away every answer asked for after it.
+	da1 chan struct{}
+
+	// frameEdits records whether the terminal passed the frame-edit probe.
+	// setupTerminal writes it once, before any frame is drawn, and the
+	// transport choice reads it.
+	frameEdits bool
+}
+
+// gfxAnswer is one kitty graphics reply: the image id the terminal echoed and
+// whether the message was OK.
+type gfxAnswer struct {
+	id int
+	ok bool
 }
 
 func newInputParser(comp *compositor) *inputParser {
@@ -56,6 +75,8 @@ func newInputParser(comp *compositor) *inputParser {
 		gotCell:      make(chan struct{}, 2),
 		decrqm1016:   make(chan bool, 1),
 		kittyKBProbe: make(chan bool, 1),
+		gfxAnswers:   make(chan gfxAnswer, 8),
+		da1:          make(chan struct{}, 1),
 	}
 }
 
@@ -94,6 +115,14 @@ func (p *inputParser) parse() {
 			p.buf = p.buf[2+consumed:]
 			continue
 		}
+		if p.buf[1] == '_' {
+			consumed := p.parseAPC(p.buf[2:])
+			if consumed < 0 {
+				return // incomplete
+			}
+			p.buf = p.buf[2+consumed:]
+			continue
+		}
 		if p.buf[1] == 'O' && len(p.buf) >= 3 {
 			// SS3: F1-F4, arrows in app mode
 			if code, ok := csiLetterToEvdev[p.buf[2]]; ok {
@@ -106,6 +135,55 @@ func (p *inputParser) parse() {
 		b := p.buf[1]
 		p.buf = p.buf[2:]
 		p.legacyAltByte(b)
+	}
+}
+
+// maxAPCLen bounds how much of an unterminated APC string is held before it is
+// written off as garbage. A terminal's graphics replies are tens of bytes; a
+// string this long is a stream that lost its terminator, and waiting for one
+// that is not coming would stall every keystroke behind it.
+const maxAPCLen = 4096
+
+// parseAPC consumes one APC string (the bytes after "ESC_"), returning how
+// many were consumed or -1 if the terminator has not arrived yet.
+//
+// Before this existed there was no APC case at all: "ESC _" fell through to
+// the legacy alt+key path, so a terminal that answered a graphics command
+// delivered "alt+_" to the guest and the rest of the reply as plain text. That
+// stayed hidden only because every escape wlterm writes carries q=2.
+func (p *inputParser) parseAPC(data []byte) int {
+	end := bytes.Index(data, []byte("\x1b\\"))
+	if end < 0 {
+		if len(data) > maxAPCLen {
+			return len(data)
+		}
+		return -1
+	}
+	p.graphicsAnswer(data[:end])
+	return end + 2
+}
+
+// graphicsAnswer reads one kitty graphics reply, "G<params>;<message>", and
+// hands the probe the image id and whether the message was OK. Anything else
+// in an APC string is not ours and is dropped.
+func (p *inputParser) graphicsAnswer(body []byte) {
+	if len(body) == 0 || body[0] != 'G' {
+		return
+	}
+	rest := body[1:]
+	semi := bytes.IndexByte(rest, ';')
+	if semi < 0 {
+		return
+	}
+	id := 0
+	for _, kv := range strings.Split(string(rest[:semi]), ",") {
+		if v, found := strings.CutPrefix(kv, "i="); found {
+			id, _ = strconv.Atoi(v)
+		}
+	}
+	select {
+	case p.gfxAnswers <- gfxAnswer{id: id, ok: bytes.HasPrefix(rest[semi+1:], []byte("OK"))}:
+	default:
 	}
 }
 
@@ -178,7 +256,7 @@ func (p *inputParser) parseCSI(data []byte) int {
 		return n
 	case 'c': // DA1 response: CSI ? ... c - end of probe window
 		select {
-		case p.kittyKBProbe <- false:
+		case p.da1 <- struct{}{}:
 		default:
 		}
 		return n
