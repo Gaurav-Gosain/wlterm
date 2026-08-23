@@ -36,6 +36,7 @@ type renderStats struct {
 	writeNs     atomic.Uint64
 	paceNs      atomic.Uint64
 	idleNs      atomic.Uint64
+	emptyWakes  atomic.Uint64
 	latencyNs   atomic.Uint64
 	ptyBytes    atomic.Uint64
 	shmBytes    atomic.Uint64
@@ -71,10 +72,17 @@ type renderer struct {
 	sub       []byte
 	b64buf    []byte
 	emitBuf   []byte
+
+	// frameFn is what loop() paces. Only a test replaces it, so that the
+	// pacing can be checked against a frame of known cost without a
+	// compositor, a client or a terminal.
+	frameFn func()
 }
 
 func newRenderer(comp *compositor, mode string, layered bool, out *os.File, maxFPS int) *renderer {
-	return &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS}
+	r := &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS}
+	r.frameFn = r.frame
+	return r
 }
 
 // loop paces frames from the start of one to the start of the next, so
@@ -86,11 +94,26 @@ func newRenderer(comp *compositor, mode string, layered bool, out *os.File, maxF
 // run at -fps 1000, where minInterval is 1ms and the frame cost dominates
 // anyway, and that is exactly where wlterm's fast numbers were measured.
 func (r *renderer) loop() {
-	minInterval := time.Second / time.Duration(r.maxFPS)
+	// -fps 0 is uncapped, and is also what keeps a zero from dividing.
+	var minInterval time.Duration
+	if r.maxFPS > 0 {
+		minInterval = time.Second / time.Duration(r.maxFPS)
+	}
 	var next time.Time
 	var prevEnd time.Time
 	for range r.comp.renderCh {
 		recv := time.Now()
+		// A wake with nothing to draw must not consume a slot of the frame
+		// budget. Two markDirty calls straddling a frame leave a token behind
+		// for a frame that has already been drawn, and paying a full interval
+		// for that token is a cap coming out below what was asked for.
+		r.comp.mu.Lock()
+		dirty := r.comp.dirty
+		r.comp.mu.Unlock()
+		if !dirty {
+			stats.emptyWakes.Add(1)
+			continue
+		}
 		if !prevEnd.IsZero() {
 			stats.idleNs.Add(uint64(recv.Sub(prevEnd)))
 		}
@@ -107,7 +130,7 @@ func (r *renderer) loop() {
 		if next.Before(start) {
 			next = start.Add(minInterval)
 		}
-		r.frame()
+		r.frameFn()
 		prevEnd = time.Now()
 	}
 }
@@ -744,6 +767,9 @@ func statsLine(elapsed time.Duration) string {
 	if n := stats.dmaCopies.Swap(0); n > 0 {
 		fmt.Fprintf(&b, " dmabuf_read=%v dmabuf_sync=%v dmabuf_reads=%d",
 			time.Duration(stats.dmaCopyNs.Swap(0)/n), time.Duration(stats.dmaSyncNs.Swap(0)/n), n)
+	}
+	if n := stats.emptyWakes.Swap(0); n > 0 {
+		fmt.Fprintf(&b, " empty_wakes=%d", n)
 	}
 	if ops := stats.chromeOps.Swap(0); ops > 0 {
 		fmt.Fprintf(&b, " chrome_repaints=%d chrome=%v", ops, time.Duration(stats.chromeNs.Swap(0)/ops))
