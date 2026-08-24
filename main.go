@@ -63,6 +63,7 @@ func main() {
 	socketName := flag.String("socket", "", "wayland socket name (default wlterm-PID)")
 	stampPath := flag.String("stamp", "", "write per-frame wallclock ms to this file")
 	multi := flag.Bool("multi", false, "multi-surface tiling mode: chrome, leader key, launcher")
+	fullscreenState := flag.Bool("fullscreen", false, "tell the app it is fullscreen; browsers then hide their own toolbars")
 	prefix := flag.String("prefix", "ctrl+b", "leader key (-multi only)")
 	quitKey := flag.String("quit-key", "ctrl+backslash", "escape hatch, tapped twice within 700ms; \"none\" intercepts nothing")
 	noDmabuf := flag.Bool("no-dmabuf", false, "do not advertise zwp_linux_dmabuf_v1")
@@ -83,11 +84,14 @@ func main() {
 	}
 
 	initPalette()
+	prSetChildSubreaper()
 	sweepOrphanShm()
 
 	comp := &compositor{
 		single:      !*multi,
+		fullscreen:  *fullscreenState,
 		clients:     map[*client]bool{},
+		windowsGone: make(chan struct{}, 1),
 		renderCh:    make(chan struct{}, 1),
 		nextImgID:   100,
 		masterRatio: masterRatio,
@@ -210,11 +214,19 @@ func main() {
 	sweepOrphanRuntime(runtimeDir)
 	childRuntime := runtimeDir
 	if *isolate {
-		childRuntime = fmt.Sprintf("%s/wlterm-rt-%d", runtimeDir, os.Getpid())
+		// The name is short on purpose. A unix socket path is 107 bytes,
+		// and a nested compositor builds its own sockets under this
+		// directory: Hyprland's event socket needs 61 bytes of instance
+		// signature on top of it and stops working if the whole path does
+		// not fit.
+		childRuntime = fmt.Sprintf("%s/wl-%d", runtimeDir, os.Getpid())
 		if err := os.MkdirAll(childRuntime, 0o700); err != nil {
 			fatal("private runtime dir: %v", err)
 		}
-		defer os.RemoveAll(childRuntime)
+		defer func() {
+			unmountUnder(childRuntime)
+			os.RemoveAll(childRuntime)
+		}()
 	}
 	sockName := *socketName
 	if sockName == "" {
@@ -270,9 +282,14 @@ func main() {
 		comp.mu.Unlock()
 	}
 	childEnv := []string{}
+	have := map[string]bool{}
 	for _, e := range os.Environ() {
-		if k, _, ok := strings.Cut(e, "="); ok && leakyEnv[k] {
+		k, _, ok := strings.Cut(e, "=")
+		if ok && leakyEnv[k] {
 			continue
+		}
+		if ok {
+			have[k] = true
 		}
 		childEnv = append(childEnv, e)
 	}
@@ -283,10 +300,27 @@ func main() {
 			childEnv = append(childEnv, "DBUS_SESSION_BUS_ADDRESS="+busAddr)
 		}
 	}
+	// Point each toolkit at Wayland. There is no X server here and no
+	// XWayland, so a toolkit that picks X11 by default does not start at
+	// all. Setting these means the user does not have to remember a flag
+	// for every application. A variable the user set is kept: this fills
+	// gaps, it does not overrule a choice.
+	for _, kv := range toolkitEnv {
+		k, _, _ := strings.Cut(kv, "=")
+		if !have[k] {
+			childEnv = append(childEnv, kv)
+		}
+	}
 	logf("isolation: runtime_dir=%s bus=%q", childRuntime, busAddr)
 
 	var childMu sync.Mutex
 	children := map[int]*exec.Cmd{}
+	// sessions keeps every session we ever started, including the ones
+	// whose leader has already exited. A launcher binary forks the real
+	// application and returns, so the leader is gone long before the window
+	// is, and the process to signal on the way out is still in that
+	// session.
+	sessions := map[int]bool{}
 	childExit := make(chan int, 8)
 	started := 0
 
@@ -318,14 +352,18 @@ func main() {
 		pid := cmd.Process.Pid
 		childMu.Lock()
 		children[pid] = cmd
+		sessions[pid] = true
 		started++
 		childMu.Unlock()
 		logf("spawned %q pid=%d argv=%q", req.name(), pid, argv)
 		startedAt := time.Now()
+		comp.mu.Lock()
+		windowsBefore := len(comp.windows)
+		comp.mu.Unlock()
 		// Setsid above makes the child a session leader, so its session id
 		// equals its pid and every descendant inherits it. That is the
 		// handle used to verify the launch below.
-		go verifyLaunch(comp, req, pid, startedAt)
+		go verifyLaunch(comp, req, pid, windowsBefore)
 		go func() {
 			err := cmd.Wait()
 			lived := time.Since(startedAt)
@@ -395,12 +433,27 @@ func main() {
 	defer statsT.Stop()
 	statsAt := time.Now()
 
+	// orphaned: every process we started has exited, so the last window
+	// closing is what ends the session. grace is the wait for a window that
+	// has not appeared yet: a launcher can return before the application it
+	// started has drawn anything.
+	orphaned := false
+	var grace <-chan time.Time
+
+	// killAll takes the whole tree with us. The process group is not
+	// enough on its own: Electron and Chromium put the process that owns
+	// the window into a session of their own, so the group we started is
+	// empty by the time it matters. VS Code outlived wlterm that way, still
+	// drawing into a socket nobody was listening on.
 	killAll := func() {
 		childMu.Lock()
-		for pid := range children {
+		mine := map[int]bool{}
+		for pid := range sessions {
+			mine[pid] = true
 			syscall.Kill(-pid, syscall.SIGTERM)
 		}
 		childMu.Unlock()
+		killTree(mine)
 	}
 
 	for {
@@ -410,11 +463,61 @@ func main() {
 			delete(children, pid)
 			left := len(children)
 			childMu.Unlock()
-			if left == 0 && started > 0 {
+			if left != 0 || started == 0 {
+				continue
+			}
+			// The process we started is gone. That is not the same as the
+			// application being gone: `code`, `thunar` and most desktop
+			// launchers start the real program and return straight away.
+			// So the question is whether anything is still on screen.
+			comp.mu.Lock()
+			onScreen := len(comp.windows)
+			everMapped := comp.windowsAdded > 0
+			comp.mu.Unlock()
+			orphaned = true
+			if onScreen > 0 {
+				logf("every process we started has exited, but %d window(s) "+
+					"are still up: staying until the last one closes",
+					onScreen)
+				continue
+			}
+			if everMapped {
+				// The application had a window and closed it. That is the
+				// ordinary way out and there is nothing to wait for.
 				time.Sleep(50 * time.Millisecond) // let the last frame drain
+				killAll()
 				cleanup(headless)
 				return
 			}
+			// Nothing has ever been on screen. A launcher that has already
+			// returned may still be starting the application, so wait
+			// before deciding that nothing is coming.
+			logf("every process we started has exited with nothing on screen: "+
+				"waiting %v for a window", orphanGrace)
+			grace = time.After(orphanGrace)
+		case <-grace:
+			grace = nil
+			comp.mu.Lock()
+			onScreen := len(comp.windows)
+			comp.mu.Unlock()
+			if onScreen > 0 {
+				logf("%d window(s) appeared: staying until the last one closes", onScreen)
+				continue
+			}
+			logf("no window appeared in %v", orphanGrace)
+			time.Sleep(50 * time.Millisecond)
+			killAll()
+			cleanup(headless)
+			return
+		case <-comp.windowsGone:
+			if !orphaned {
+				continue
+			}
+			logf("the last window closed")
+			time.Sleep(50 * time.Millisecond)
+			killAll()
+			cleanup(headless)
+			return
 		case <-p.quit:
 			logf("quit requested (terminal)")
 			killAll()
@@ -484,6 +587,33 @@ var leakyEnv = map[string]bool{
 	"NIRI_SOCKET":                 true,
 	"KDE_FULL_SESSION":            true,
 	"KDE_SESSION_UID":             true,
+	// Not a socket, but it names the host desktop, and a portal reads it to
+	// decide which backend to load. Inherited, the portal loads the host
+	// compositor's backend, which then goes looking for the host's IPC
+	// socket. toolkitEnv puts wlterm's own name back.
+	"XDG_CURRENT_DESKTOP": true,
+	"XDG_SESSION_DESKTOP": true,
+	"DESKTOP_SESSION":     true,
+}
+
+// toolkitEnv tells each toolkit to use Wayland, and tells the desktop
+// portal which desktop it is on. Only set where the parent environment does
+// not already have the variable.
+//
+// XDG_CURRENT_DESKTOP matters as much as the backend variables. It is what a
+// portal reads to choose an implementation, and inheriting the host's value
+// makes the portal load the host desktop's backend, which then looks for the
+// host compositor's IPC socket. wlterm is its own desktop, so it says so.
+var toolkitEnv = []string{
+	"XDG_SESSION_TYPE=wayland",
+	"XDG_CURRENT_DESKTOP=wlterm",
+	"GDK_BACKEND=wayland",
+	"QT_QPA_PLATFORM=wayland",
+	"SDL_VIDEODRIVER=wayland",
+	"CLUTTER_BACKEND=wayland",
+	"MOZ_ENABLE_WAYLAND=1",
+	"ELECTRON_OZONE_PLATFORM_HINT=wayland",
+	"_JAVA_AWT_WM_NONREPARENTING=1",
 }
 
 // startPrivateBus runs a session bus that only our children can reach.
@@ -510,7 +640,16 @@ func startPrivateBus(dir, waylandSocket string) (addr string, pid int, stop func
 		}
 		env = append(env, e)
 	}
-	cmd.Env = append(env, "XDG_RUNTIME_DIR="+dir, "WAYLAND_DISPLAY="+waylandSocket)
+	env = append(env, "XDG_RUNTIME_DIR="+dir, "WAYLAND_DISPLAY="+waylandSocket)
+	// A service the bus activates inherits this, so it needs the same
+	// toolkit settings the direct children get.
+	for _, kv := range toolkitEnv {
+		k, _, _ := strings.Cut(kv, "=")
+		if os.Getenv(k) == "" || leakyEnv[k] {
+			env = append(env, kv)
+		}
+	}
+	cmd.Env = env
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", 0, func() {}
@@ -584,7 +723,13 @@ func sessionOf(pid int) int {
 
 // launchVerifyAfter is how long an application gets to put a window on
 // screen before the launch is reported as unverified.
-const launchVerifyAfter = 6 * time.Second
+const launchVerifyAfter = 15 * time.Second
+
+// orphanGrace is how long wlterm waits for a window after every process it
+// started has exited. A desktop launcher returns in about a second and the
+// application it started draws a second or two later, so exiting the moment
+// the process does would kill it before it appeared.
+const orphanGrace = 10 * time.Second
 
 // verifyLaunch checks the framebuffer, not the exit code.
 //
@@ -593,28 +738,43 @@ const launchVerifyAfter = 6 * time.Second
 // somewhere else, exits 0, and shows the user nothing. So the check is
 // "does a mapped window belong to a process in the session we started",
 // which is exactly the question an exit code cannot answer.
-func verifyLaunch(comp *compositor, req spawnReq, pid int, startedAt time.Time) {
-	time.Sleep(launchVerifyAfter)
-	comp.mu.Lock()
-	busSid := comp.busSid
-	var mine, viaBus, others int
-	for _, w := range comp.windows {
-		if w.top == nil || w.top.client == nil || w.area.empty() {
-			continue
+func verifyLaunch(comp *compositor, req spawnReq, pid, windowsBefore int) {
+	// Poll rather than sample once. A browser on a busy machine can take
+	// ten seconds to draw, and a single look at six seconds reported a
+	// launch as failed while it was still starting.
+	var mine, viaBus, others, total int
+	deadline := time.Now().Add(launchVerifyAfter)
+	for {
+		mine, viaBus, others = 0, 0, 0
+		comp.mu.Lock()
+		busSid := comp.busSid
+		total = len(comp.windows)
+		for _, w := range comp.windows {
+			if w.top == nil || w.top.client == nil || w.area.empty() {
+				continue
+			}
+			switch {
+			case w.top.client.sid == pid:
+				mine++
+			case busSid != 0 && w.top.client.sid == busSid:
+				// A DBus-activatable application is started by the bus, so
+				// its window belongs to the bus's session rather than to
+				// the pid we spawned. That is still inside wlterm; it is
+				// our bus.
+				viaBus++
+			default:
+				others++
+			}
 		}
-		switch {
-		case w.top.client.sid == pid:
-			mine++
-		case busSid != 0 && w.top.client.sid == busSid:
-			// A DBus-activatable application is started by the bus, so its
-			// window belongs to the bus's session rather than to the pid we
-			// spawned. That is still inside wlterm; it is our bus.
-			viaBus++
-		default:
-			others++
+		comp.mu.Unlock()
+		if mine > 0 || viaBus > 0 || total > windowsBefore {
+			break
 		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	comp.mu.Unlock()
 	if mine > 0 {
 		logf("launch VERIFIED: %s (pid %d) has %d window(s) in the framebuffer", req.name(), pid, mine)
 		return
@@ -622,6 +782,16 @@ func verifyLaunch(comp *compositor, req spawnReq, pid int, startedAt time.Time) 
 	if viaBus > 0 {
 		logf("launch VERIFIED via our private bus: %s (pid %d) exited, but %d window(s) "+
 			"belong to a service our own bus activated", req.name(), pid, viaBus)
+		return
+	}
+	// A browser and an Electron application both start their own session
+	// for the process that owns the window, so the session we started is
+	// not the one on screen. The window count is the check that still
+	// works: something appeared here that was not here before.
+	if total > windowsBefore {
+		logf("launch VERIFIED by count: %s (pid %d) is in a session of its own, "+
+			"and the pane went from %d window(s) to %d",
+			req.name(), pid, windowsBefore, total)
 		return
 	}
 	logf("launch UNVERIFIED: %s (pid %d) put no window on screen in %v "+
@@ -722,4 +892,149 @@ func pickTransport(frameEdits bool) (mode, why string) {
 		return "delta", "the terminal applied a test frame edit and refused a bad one"
 	}
 	return "shm", "shared memory is safe everywhere"
+}
+
+// ---- taking the whole tree with us ----
+
+// prSetChildSubreaper makes orphaned descendants reparent to wlterm instead
+// of to init. Without it a program that double-forks -- Electron and every
+// Chromium do -- is no longer reachable from here the moment its launcher
+// exits, and it outlives the compositor it was drawing into. VS Code did
+// exactly that: wlterm went away and the window's process kept running
+// against a socket nobody was listening on.
+func prSetChildSubreaper() {
+	const prSetChildSubreaper = 36
+	if _, _, errno := syscall.Syscall(syscall.SYS_PRCTL, prSetChildSubreaper, 1, 0); errno != 0 {
+		logf("child subreaper unavailable: %v", errno)
+	}
+}
+
+// procParents reads every process's parent from /proc.
+func procParents() map[int]int {
+	parents := map[int]int{}
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return parents
+	}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		// The comm field can hold spaces and parentheses, so parsing starts
+		// after its closing paren: state, then ppid.
+		i := strings.LastIndexByte(string(b), ')')
+		if i < 0 {
+			continue
+		}
+		f := strings.Fields(string(b[i+1:]))
+		if len(f) < 2 {
+			continue
+		}
+		if ppid, err := strconv.Atoi(f[1]); err == nil {
+			parents[pid] = ppid
+		}
+	}
+	return parents
+}
+
+// descendants lists every process below us, plus anything left in a session
+// we started. Two answers to the same question, because a process that
+// changed its session is still our child, and a child that outran the
+// subreaper is still in our session.
+func descendants(sessions map[int]bool) []int {
+	me := os.Getpid()
+	parents := procParents()
+	children := map[int][]int{}
+	for pid, ppid := range parents {
+		children[ppid] = append(children[ppid], pid)
+	}
+	seen := map[int]bool{}
+	var walk func(int)
+	walk = func(pid int) {
+		for _, c := range children[pid] {
+			if c == me || seen[c] {
+				continue
+			}
+			seen[c] = true
+			walk(c)
+		}
+	}
+	walk(me)
+	for sid := range sessions {
+		for pid := range parents {
+			if pid == me || seen[pid] {
+				continue
+			}
+			if sessionOf(pid) == sid {
+				seen[pid] = true
+				walk(pid)
+			}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for pid := range seen {
+		out = append(out, pid)
+	}
+	return out
+}
+
+// killTree asks everything we started to stop, then insists. A Wayland
+// client usually exits on its own when the socket closes, and some do not.
+func killTree(sessions map[int]bool) {
+	pids := descendants(sessions)
+	if len(pids) == 0 {
+		return
+	}
+	for _, pid := range pids {
+		syscall.Kill(pid, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, pid := range pids {
+			if syscall.Kill(pid, 0) == nil {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	left := 0
+	for _, pid := range pids {
+		if syscall.Kill(pid, 0) == nil {
+			syscall.Kill(pid, syscall.SIGKILL)
+			left++
+		}
+	}
+	if left > 0 {
+		logf("killed %d process(es) that did not stop when asked", left)
+	}
+}
+
+// unmountUnder drops any fuse mount a child left inside our private runtime
+// directory. xdg-document-portal and gvfs both mount there, and a mount is
+// why the directory outlived the process that made it.
+func unmountUnder(dir string) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		p := dir + "/" + e.Name()
+		if err := syscall.Rmdir(p); err == nil || err == syscall.ENOTEMPTY {
+			continue // not a mount point
+		}
+		exec.Command("fusermount3", "-u", p).Run()
+	}
 }

@@ -25,6 +25,7 @@ type window struct {
 	imgID        uint32    // kitty image id for per-window transmission
 	sentW, sentH int       // last size we configured the client with
 	sentFocus    bool      // last activated state we configured
+	float        bool      // single-app mode: a dialog over the application
 	imgW, imgH   int       // size of the image the terminal currently holds
 	dmg          damageSet // pending damage, canvas pixel coords
 	needsFull    bool      // retransmit the whole window image
@@ -366,30 +367,72 @@ func (comp *compositor) relayout() {
 // pane, the ones underneath are hidden. That is what a dialog wants, and it
 // is what cage does with the same input.
 func (comp *compositor) relayoutSingle() {
+	cw, ch := comp.cellW, comp.cellH
 	full := rect{0, 0, comp.widthPx, comp.heightPx}
-	comp.region = cellRect{0, 0, comp.widthPx / comp.cellW, comp.heightPx / comp.cellH}
-	var top *window
+	comp.region = cellRect{0, 0, comp.widthPx / cw, comp.heightPx / ch}
 	for _, w := range comp.windows {
-		w.cell = cellRect{}
 		if !w.area.empty() {
 			// A window that had the pane and is losing it owes the ground
 			// underneath a repaint.
 			comp.chromeLayout = true
 		}
+		w.cell = cellRect{}
 		w.area = rect{}
-		top = w
+		w.float = false
 	}
-	if top != nil {
-		top.cell = comp.region
-		top.area = full
+	// The first toplevel is the application and it owns the pane. Every
+	// later one is a dialog the application opened: a keyring prompt, a
+	// print sheet, a file chooser. Those float on top at their own size
+	// rather than replacing what is underneath, because a browser that
+	// vanishes the moment it asks a question is not usable.
+	var top *window
+	for i, w := range comp.windows {
+		if i == 0 {
+			w.cell = comp.region
+			w.area = full
+			top = w
+			continue
+		}
+		w.float = true
+		w.cell, w.area = comp.floatRect(w)
+		if !w.area.empty() {
+			top = w
+		}
 	}
 	comp.setFocus(top) // no-op when the same window still owns the pane
 	comp.configureAll()
-	if top != nil {
-		top.needsFull = true
-		top.dmg.set(top.area)
+	for _, w := range comp.windows {
+		if w.area.empty() {
+			continue
+		}
+		w.needsFull = true
+		w.dmg.set(w.area)
 	}
 	comp.markDirty()
+}
+
+// floatRect centres a dialog over the pane at the size it drew itself,
+// snapped to the cell grid because that is where an image can be placed. A
+// dialog with nothing drawn yet has no size to centre, so it gets no
+// rectangle and is not composited until it commits one.
+func (comp *compositor) floatRect(w *window) (cellRect, rect) {
+	if w.top == nil || w.top.surf == nil || w.top.surf.content == nil {
+		return cellRect{}, rect{}
+	}
+	cw, ch := comp.cellW, comp.cellH
+	cols := (w.top.surf.w + cw - 1) / cw
+	rows := (w.top.surf.h + ch - 1) / ch
+	if cols > comp.region.w {
+		cols = comp.region.w
+	}
+	if rows > comp.region.h {
+		rows = comp.region.h
+	}
+	if cols < 1 || rows < 1 {
+		return cellRect{}, rect{}
+	}
+	c := cellRect{(comp.region.w - cols) / 2, (comp.region.h - rows) / 2, cols, rows}
+	return c, c.px(cw, ch)
 }
 
 // tileGap is the one reserved cell between neighbouring tiles that the
@@ -414,6 +457,7 @@ func (comp *compositor) addWindow(t *xdgToplevel) *window {
 	comp.nextImgID++
 	t.win = w
 	comp.windows = append(comp.windows, w)
+	comp.windowsAdded++
 	comp.root = comp.root.insert(comp.focus, w, comp.nextSplit)
 	comp.nextSplit = splitAuto
 	comp.zoomed = nil
@@ -457,6 +501,12 @@ func (comp *compositor) removeWindow(w *window) {
 	}
 	comp.relayout()
 	logf("window removed: %d left", len(comp.windows))
+	if len(comp.windows) == 0 && comp.windowsGone != nil {
+		select {
+		case comp.windowsGone <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // windowAt returns the window whose content rect contains the pixel, or the
@@ -467,13 +517,15 @@ func (comp *compositor) windowAt(x, y int) *window {
 		return nil
 	}
 	cx, cy := x/cw, y/ch
-	for _, w := range comp.windows {
-		o := w.cell
+	// Topmost first. In single-app mode a dialog floats over the
+	// application, and a click inside it belongs to the dialog.
+	for i := len(comp.windows) - 1; i >= 0; i-- {
+		o := comp.windows[i].cell
 		if o.w == 0 {
 			continue
 		}
 		if cx >= o.x && cx < o.x+o.w && cy >= o.y && cy < o.y+o.h {
-			return w
+			return comp.windows[i]
 		}
 	}
 	// In a divider cell: give it to the nearest tile so a click on a rule

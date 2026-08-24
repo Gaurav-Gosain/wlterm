@@ -109,6 +109,15 @@ func (s *wlSurface) commit(c *client) {
 	}
 
 	w := comp.windowForSurface(s)
+	// A floating dialog is placed from the size it drew itself, so its
+	// rectangle is only known once it has committed one, and it moves again
+	// if the dialog grows.
+	if w != nil && w.float && w.top != nil && w.top.surf == s {
+		if nc, na := comp.floatRect(w); na != w.area {
+			_ = nc
+			comp.relayout()
+		}
+	}
 	if w == nil || w.area.empty() {
 		s.pendingDamage = rect{}
 		return
@@ -402,6 +411,10 @@ func (x *xdgSurface) sendConfigure(c *client, comp *compositor) {
 			w = t.win.area.x1 - t.win.area.x0
 			h = t.win.area.y1 - t.win.area.y0
 		}
+		// A floating dialog picks its own size. Zero says so.
+		if t.win != nil && t.win.float {
+			w, h = 0, 0
+		}
 		c.event(t.id, 0, int32(w), int32(h), toplevelStates(comp, t))
 		if t.win != nil {
 			t.win.sentW, t.win.sentH = w, h
@@ -418,17 +431,30 @@ func (x *xdgSurface) sendConfigure(c *client, comp *compositor) {
 // activated only on the focused tile, plus the tiled_* states so clients
 // that understand them square off their corners.
 func toplevelStates(comp *compositor, t *xdgToplevel) []byte {
+	// A floating dialog is not maximized and not tiled. Telling it
+	// otherwise makes it stretch to a size it never asked for.
+	if t.win != nil && t.win.float {
+		if comp.focus == t.win {
+			return stateBytes([]uint32{4}) // activated
+		}
+		return stateBytes(nil)
+	}
 	states := []uint32{1} // maximized
-	if comp.single {
-		// The pane is the screen. Fullscreen says that in the one term
-		// every toolkit understands: no decorations, no shadow, no rounded
-		// corners, no client-side title bar to sit inside tuios's own.
+	if comp.single && comp.fullscreen {
+		// -fullscreen is for a client that has no window controls of its
+		// own to lose. It removes the client's own title bar, and with it
+		// every menu and toolbar the client hides in fullscreen: a browser
+		// told this shows the page and nothing else.
 		states = append(states, 2) // fullscreen
 	}
 	if t.win != nil && comp.focus == t.win {
 		states = append(states, 4) // activated
 	}
 	states = append(states, 5, 6, 7, 8) // tiled left/right/top/bottom
+	return stateBytes(states)
+}
+
+func stateBytes(states []uint32) []byte {
 	buf := make([]byte, 4*len(states))
 	for i, v := range states {
 		binary.LittleEndian.PutUint32(buf[i*4:], v)
@@ -449,11 +475,14 @@ func (comp *compositor) configureAll() {
 		if !w.area.empty() {
 			nw, nh = w.area.x1-w.area.x0, w.area.y1-w.area.y0
 		}
+		if w.float {
+			nw, nh = 0, 0 // its size is its own; only the focus can change
+		}
 		focused := comp.focus == w
 		if nw == w.sentW && nh == w.sentH && focused == w.sentFocus {
 			continue
 		}
-		if nw == 0 || nh == 0 {
+		if !w.float && (nw == 0 || nh == 0) {
 			continue
 		}
 		w.sentW, w.sentH, w.sentFocus = nw, nh, focused

@@ -48,7 +48,7 @@ var csiTildeToEvdev = map[int]uint32{
 }
 
 // kitty modifier bits (mods-1): shift 1, alt 2, ctrl 4, super 8, hyper 16,
-// meta 32, capslock 64, numlock 128.
+// meta 32, numlock 64, capslock 128.
 // xkb mask for our us keymap: Shift 1, Lock 2, Control 4, Mod1 8, Mod2 16,
 // Mod4 64.
 func kittyModsToXkb(m uint32) uint32 {
@@ -66,10 +66,10 @@ func kittyModsToXkb(m uint32) uint32 {
 		x |= 64
 	}
 	if m&64 != 0 {
-		x |= 2
+		x |= 16 // num lock is Mod2
 	}
 	if m&128 != 0 {
-		x |= 16
+		x |= 2 // caps lock is Lock
 	}
 	return x
 }

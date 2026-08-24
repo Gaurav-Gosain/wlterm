@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+)
 
 func newSingleComp(w, h, cw, ch int) *compositor {
 	return &compositor{
@@ -48,23 +51,86 @@ func TestSingleAppFollowsAResize(t *testing.T) {
 	}
 }
 
-// Extra toplevels stack rather than tile: the newest owns the pane and the
-// ones underneath get nothing, which is what a dialog wants.
-func TestSingleAppStacksExtraToplevels(t *testing.T) {
+// Extra toplevels float rather than tile: the application keeps the pane and
+// the dialog it opened sits on top of it, centred at its own size. A browser
+// that disappears the moment it asks for a keyring password is not usable.
+func TestSingleAppFloatsADialogOverTheApp(t *testing.T) {
 	comp := newSingleComp(800, 600, 10, 20)
 	first := &window{top: &xdgToplevel{}}
-	second := &window{top: &xdgToplevel{}}
-	comp.windows = append(comp.windows, first, second)
+	dialog := &window{top: &xdgToplevel{surf: &wlSurface{
+		content: make([]byte, 200*100*4), w: 200, h: 100,
+	}}}
+	comp.windows = append(comp.windows, first, dialog)
 	comp.relayout()
 
-	if !first.area.empty() {
-		t.Errorf("older toplevel still has %+v, want nothing", first.area)
+	if got, want := first.area, (rect{0, 0, 800, 600}); got != want {
+		t.Errorf("the application lost the pane: %+v, want %+v", got, want)
 	}
-	if got, want := second.area, (rect{0, 0, 800, 600}); got != want {
-		t.Errorf("newest toplevel = %+v, want %+v", got, want)
+	if !dialog.float {
+		t.Errorf("the second toplevel was not marked as floating")
 	}
-	if comp.focus != second {
-		t.Errorf("focus did not follow the newest toplevel")
+	// 200x100 at a 10x20 cell is 20x5 cells, centred in 80x30 cells: cell
+	// (30,12), so pixel (300,240).
+	if got, want := dialog.area, (rect{300, 240, 500, 340}); got != want {
+		t.Errorf("dialog = %+v, want %+v", got, want)
+	}
+	if comp.focus != dialog {
+		t.Errorf("focus did not follow the dialog")
+	}
+	// A click inside the dialog belongs to the dialog, not to the pane it
+	// covers.
+	if got := comp.windowAt(400, 300); got != dialog {
+		t.Errorf("click inside the dialog hit the wrong window")
+	}
+	if got := comp.windowAt(20, 20); got != first {
+		t.Errorf("click outside the dialog did not reach the application")
+	}
+}
+
+// A dialog with nothing drawn yet has no size to centre, so it is not placed
+// and the application underneath stays visible.
+func TestSingleAppDoesNotPlaceAnUndrawnDialog(t *testing.T) {
+	comp := newSingleComp(800, 600, 10, 20)
+	first := &window{top: &xdgToplevel{}}
+	dialog := &window{top: &xdgToplevel{surf: &wlSurface{}}}
+	comp.windows = append(comp.windows, first, dialog)
+	comp.relayout()
+
+	if got, want := first.area, (rect{0, 0, 800, 600}); got != want {
+		t.Errorf("the application lost the pane: %+v, want %+v", got, want)
+	}
+	if !dialog.area.empty() {
+		t.Errorf("an undrawn dialog was placed at %+v", dialog.area)
+	}
+}
+
+// The fullscreen state is what makes a browser hide its own tab strip and
+// address bar, so it is off unless it is asked for.
+func TestSingleAppDoesNotClaimFullscreen(t *testing.T) {
+	comp := newSingleComp(800, 600, 10, 20)
+	w := &window{top: &xdgToplevel{}}
+	w.top.win = w
+	comp.windows = append(comp.windows, w)
+	comp.relayout()
+
+	has := func(states []byte, want uint32) bool {
+		for i := 0; i+4 <= len(states); i += 4 {
+			if binary.LittleEndian.Uint32(states[i:]) == want {
+				return true
+			}
+		}
+		return false
+	}
+	st := toplevelStates(comp, w.top)
+	if has(st, 2) {
+		t.Errorf("fullscreen was sent without -fullscreen")
+	}
+	if !has(st, 1) {
+		t.Errorf("maximized was not sent")
+	}
+	comp.fullscreen = true
+	if !has(toplevelStates(comp, w.top), 2) {
+		t.Errorf("-fullscreen did not send the fullscreen state")
 	}
 }
 

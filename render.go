@@ -190,9 +190,19 @@ func (r *renderer) frame() {
 	}
 
 	var items []emitItem
-	for _, w := range comp.windows {
+	for wi, w := range comp.windows {
 		if w.area.empty() {
 			continue
+		}
+		// Stacking order for the terminal. Tiles never overlap, so this
+		// only matters in single-app mode, where a dialog floats over the
+		// application. overlayZ keeps the launcher above all of them.
+		wz := 1
+		if w.float {
+			wz = 1 + wi
+			if wz >= overlayZ {
+				wz = overlayZ - 1
+			}
 		}
 		if w.dmg.empty() && !w.needsFull {
 			continue
@@ -210,7 +220,7 @@ func (r *renderer) frame() {
 		}
 		items = append(items, emitItem{
 			imgID: w.imgID, area: w.area, dmg: dmg,
-			col: w.cell.x + 1, row: w.cell.y + 1, z: 1, full: full,
+			col: w.cell.x + 1, row: w.cell.y + 1, z: wz, full: full,
 		})
 		w.dmg.clear()
 		w.needsFull = false
@@ -449,13 +459,28 @@ func (r *renderer) compositeWindow(w *window, clip rect) {
 		fillRect(comp.frame, comp.frameW, comp.frameH, clip, pal.empty)
 		return
 	}
-	// A client that has not resized to its new tile yet leaves a margin;
-	// paint it with the tile ground rather than stale pixels.
-	if root.w < w.area.x1-w.area.x0 || root.h < w.area.y1-w.area.y0 {
+	// A floating dialog is blended, not stamped: a toolkit commits its drop
+	// shadow and its rounded corners as transparent pixels around the
+	// window, and stamping those over the application below paints a black
+	// box around the dialog. Blending needs the ground back first, so the
+	// application underneath is recomposited into the same rectangle.
+	blend := false
+	if w.float {
+		blend = true
+		for _, base := range comp.windows {
+			if base == w || base.float || base.area.empty() {
+				continue
+			}
+			r.compositeWindow(base, clip)
+			break
+		}
+	} else if root.w < w.area.x1-w.area.x0 || root.h < w.area.y1-w.area.y0 {
+		// A client that has not resized to its new tile yet leaves a
+		// margin; paint it with the tile ground rather than stale pixels.
 		fillRect(comp.frame, comp.frameW, comp.frameH, clip, pal.empty)
 	}
 	blitBGRAtoRGBA(comp.frame, comp.frameW, comp.frameH, root.content, root.w, root.h,
-		w.area.x0, w.area.y0, false, clip)
+		w.area.x0, w.area.y0, blend, clip)
 	for _, sub := range root.children {
 		if sub.surf != nil && sub.surf.content != nil {
 			off := offsetOf(sub.surf)
@@ -760,7 +785,13 @@ func sweepOrphanRuntime(base string) {
 	}
 	for _, e := range ents {
 		var pid int
-		if n, _ := fmt.Sscanf(e.Name(), "wlterm-rt-%d", &pid); n != 1 {
+		n, _ := fmt.Sscanf(e.Name(), "wl-%d", &pid)
+		if n != 1 {
+			// The name used to be longer. Sweep those too, so an upgrade
+			// does not strand the directories the old build left behind.
+			n, _ = fmt.Sscanf(e.Name(), "wlterm-rt-%d", &pid)
+		}
+		if n != 1 {
 			continue
 		}
 		if pid == os.Getpid() {
@@ -769,6 +800,7 @@ func sweepOrphanRuntime(base string) {
 		if err := syscall.Kill(pid, 0); err == nil || err == syscall.EPERM {
 			continue
 		}
+		unmountUnder(base + "/" + e.Name())
 		os.RemoveAll(base + "/" + e.Name())
 		logf("swept orphaned runtime dir from pid %d", pid)
 	}

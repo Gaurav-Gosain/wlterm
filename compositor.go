@@ -39,6 +39,22 @@ type compositor struct {
 	// layout modes and every keybinding are inert.
 	single bool
 
+	// fullscreen adds the fullscreen state to the configure in single-app
+	// mode. A client that reads it hides its own toolbars, so it is off by
+	// default: a browser told it is fullscreen shows the page and drops the
+	// tab strip and the address bar.
+	fullscreen bool
+
+	// windowsGone fires when the last window closes. main watches it so an
+	// application whose launcher process has already exited still keeps
+	// wlterm alive for as long as it has a window on screen.
+	windowsGone chan struct{}
+
+	// windowsAdded counts every toplevel that was ever mapped. main uses it
+	// to tell "the application has closed" from "the application has not
+	// opened yet", which look the same from a window count of zero.
+	windowsAdded int
+
 	// Tiling state. windows is creation order (master-stack reads it as
 	// master-first); root is the BSP tree over the same set.
 	windows     []*window
@@ -285,8 +301,11 @@ func (wlRegistry) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	case "wl_output":
 		c.objects[newID] = wlOutput{}
 		comp := c.comp
-		// geometry: x,y,phys_w,phys_h,subpixel,make,model,transform
-		c.event(newID, 0, int32(0), int32(0), int32(comp.widthPx*254/9600), int32(comp.heightPx*254/9600), int32(0), "wlterm", "pane", int32(0))
+		// geometry: x,y,phys_w,phys_h,subpixel,make,model,transform.
+		// The physical size is the pane at 96 dpi, which is 25.4/96 mm a
+		// pixel. It was a tenth of that once, so the pane claimed 960 dpi
+		// and toolkits that size themselves from it drew everything huge.
+		c.event(newID, 0, int32(0), int32(0), int32(comp.widthPx*254/960), int32(comp.heightPx*254/960), int32(0), "wlterm", "pane", int32(0))
 		// mode: flags(current|preferred), w, h, refresh mHz
 		c.event(newID, 1, uint32(3), int32(comp.widthPx), int32(comp.heightPx), int32(60000))
 		if version >= 2 {
