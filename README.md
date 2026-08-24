@@ -60,12 +60,165 @@ already draws the border and the title and already owns the leader key.
 - No chrome. wlterm draws no frame, no title, no dock. The client gets the
   pane's exact pixel size; tiling mode would round it to whole cells.
 - No leader key. Every keystroke goes to the app.
-- Resizes with the pane, exits when the app exits, and exits on
-  `SIGHUP`/`SIGTERM`, so closing the pane closes it.
+- Resizes with the pane, and exits on `SIGHUP`/`SIGTERM`, so closing the
+  pane closes it.
+- Exits when the last window closes, not when the process exits. Most
+  desktop launchers (`code`, `thunar`, `nautilus`) start the real program
+  and return in about a second, so exiting with the process killed the
+  application a moment after it appeared. If nothing has been drawn yet it
+  waits 10 seconds for a window before giving up.
+- A dialog floats. The application keeps the pane and the window it opens
+  sits over it, centred, at the size it drew itself. Extra toplevels used to
+  replace the application, so a browser asking for a keyring password
+  replaced itself with the prompt.
 
 The escape hatch is `ctrl+\` tapped twice inside 700ms. A single press still
 reaches the app. `-quit-key ctrl+q` picks a different key; `-quit-key none`
 intercepts nothing.
+
+The window is maximized, not fullscreen. That distinction is the whole
+difference between a browser you can use and one you cannot: a client told
+it is fullscreen hides its own toolbars, so Chromium drew the page and
+dropped the tab strip, the address bar and every control with them. wlterm
+sent that state unconditionally once. `-fullscreen` asks for it back, which
+is what you want for a video player and not for anything else.
+
+## Running applications
+
+Every command below was run under wlterm and watched on screen. Each one
+puts a window in the framebuffer, takes keyboard input and takes mouse
+input.
+
+wlterm sets the toolkit variables its children need, so there is no cheat
+sheet of flags per application. `GDK_BACKEND`, `QT_QPA_PLATFORM`,
+`SDL_VIDEODRIVER`, `CLUTTER_BACKEND`, `MOZ_ENABLE_WAYLAND`,
+`ELECTRON_OZONE_PLATFORM_HINT` and `XDG_SESSION_TYPE` are all set to
+Wayland, and only where you have not set them yourself. There is no X
+server here and no XWayland, so a toolkit left to guess picks X11 and does
+not start at all.
+
+`XDG_CURRENT_DESKTOP` is the exception: it is replaced rather than filled
+in. It names the desktop a portal loads a backend for, and the host's value
+sends the portal looking for the host compositor's socket.
+
+**A terminal.**
+
+```sh
+./wlterm -- foot
+./wlterm -- kitty
+```
+
+**A Chromium browser.** No flags needed.
+
+```sh
+./wlterm -- chromium
+./wlterm -- helium-browser
+```
+
+![Chromium running inside a wlterm pane, with its tab strip and address bar](assets/chromium.png)
+
+Two things are worth knowing. Chromium is one instance per profile: if a
+copy is already running on your desktop, a second one hands it the URL and
+exits, so the tab opens out there and wlterm shows nothing. `-user-data-dir`
+gives the pane its own profile and its own instance:
+
+```sh
+./wlterm -- chromium --user-data-dir=$HOME/.cache/wlterm-chromium
+```
+
+wlterm says so when it happens: `launch UNVERIFIED ... it may have been
+handed to an instance outside wlterm`.
+
+The second is the keyring. Chromium asks the session bus for a password
+store, gnome-keyring starts and asks you to choose a password. The prompt
+floats over the browser and you can answer it or cancel it. To skip it,
+`--password-store=basic`.
+
+**An Electron application.**
+
+```sh
+./wlterm -- code --new-window .
+```
+
+Electron reads `ELECTRON_OZONE_PLATFORM_HINT`, which wlterm sets. VS Code
+draws its own title bar rather than taking wlterm's server-side decoration,
+so you get one row of window controls you cannot use.
+
+**A GTK application.**
+
+```sh
+./wlterm -- thunar ~
+```
+
+**A Qt application.**
+
+```sh
+./wlterm -- dolphin ~
+```
+
+**Something on the GPU.**
+
+```sh
+./wlterm -- vkcube
+```
+
+## A compositor inside the pane
+
+Hyprland runs nested inside wlterm, and it is a real Hyprland: tiling,
+animations, wallpaper, `hyprctl`.
+
+![Hyprland running nested inside a wlterm pane, tiling a terminal beside vkcube over its wallpaper](assets/hyprland.png)
+
+That is Hyprland tiling a terminal and a spinning Vulkan cube, inside a
+terminal.
+
+```sh
+cat > ~/.config/hypr/nested.conf <<'CONF'
+monitor = , preferred, auto, 1
+exec-once = foot
+misc {
+    disable_hyprland_logo = true
+    disable_splash_rendering = true
+    force_default_wallpaper = 0
+}
+CONF
+./wlterm -- Hyprland -c ~/.config/hypr/nested.conf
+```
+
+`nested.conf` in this repository is that file.
+
+Give it its own config. The default one starts a bar, a notification daemon
+and a wallpaper daemon, and binds keys that belong to your real session.
+
+It works because Hyprland asks for exactly what wlterm has. It renders with
+EGL on the render node and hands the result over as a dmabuf, and
+`DRM_FORMAT_MOD_LINEAR` is a modifier it accepts, so the one modifier
+wlterm advertises is enough. wlterm then reads the frame back with a
+`memcpy`, the same as for any other client. Nothing else was needed: no
+`wp_presentation`, no explicit synchronisation, no dmabuf feedback beyond
+the one device and the one modifier already on offer.
+
+Measured at 1280x760, with vkcube running inside the nested Hyprland, it
+held the 30 fps cap it was given for the whole run, at 2.6ms of compositing
+a frame and 30 dmabuf reads a second. No protocol error in either
+direction.
+
+Vulkan inside it works because the dmabuf reaches wlterm the same way:
+
+```sh
+./wlterm -- Hyprland -c ~/.config/hypr/nested.conf   # with exec-once = vkcube
+```
+
+What it does not get: no keyboard layout of its own (wlterm's map is US
+only), no clipboard between it and the host, and no cursor, because wlterm
+drops client cursors and Hyprland draws its own.
+
+`hyprctl` works, including `hyprctl keyword`, which changes a setting live.
+That needs the path to Hyprland's socket to fit in the 107 bytes a unix
+socket address allows, and Hyprland spends 61 of them on its instance
+signature. wlterm's private runtime directory is named to leave room. If
+your `XDG_RUNTIME_DIR` is longer than `/run/user/1000`, expect
+`Socket2 path is too long` and no IPC. Everything else still runs.
 
 ## Multi mode
 
@@ -240,6 +393,7 @@ wire.
 | flag | meaning |
 |---|---|
 | `-multi` | multi-surface tiling mode (default: single app) |
+| `-fullscreen` | tell the app it is fullscreen; browsers then hide their own toolbars |
 | `-quit-key` | escape hatch, tapped twice; `none` intercepts nothing |
 | `-mode` | `auto` \| `delta` \| `shm` \| `b64` transport |
 | `-layers` | `per-window` \| `single` image granularity |
@@ -272,11 +426,22 @@ wlterm crashed a desktop session once, early on. The rules come from that.
 - Outbound frames use a fixed 8-slot ring of `/dev/shm` files, unlinked on
   reuse and on every exit path, so a terminal that never unlinks cannot
   make wlterm leak tmpfs at frame rate.
+- wlterm takes its whole process tree with it. Signalling the process group
+  is not enough, because Electron and Chromium move the process that owns
+  the window into a session of their own: VS Code outlived wlterm that way,
+  still drawing into a socket nobody was listening on. wlterm now registers
+  as a child subreaper, so an orphan reparents to it rather than to init,
+  and on the way out it walks its own descendants and signals each one.
+- The private runtime directory is unmounted before it is removed. The
+  document portal and gvfs both mount inside it, and a mount is why the
+  directory used to survive the process that made it.
 
 ## Verifying
 
 - `./run_pane.sh` runs everything inside a real tuios pane and prints the
   numbers above.
+- `./run_apps.sh` runs every application in "Running applications", each in
+  its own throwaway `HOME`, and reports what reached the framebuffer.
 - `./run_safety.sh` and `dmaevil/` throw hostile clients at the compositor.
   Every case must end with the client refused and the compositor alive.
 - `kittydec/` decodes wlterm's own output stream back into PNGs to
@@ -294,4 +459,19 @@ wlterm crashed a desktop session once, early on. The rules come from that.
 ## Known gaps
 
 Client cursors are dropped, so the pointer works but is invisible. The
-clipboard is a stub. The keyboard map is US layout only.
+clipboard is a stub. The keyboard map is US layout only, so a client that
+asks wlterm for a layout gets a US one whatever your host terminal sends.
+
+There is no XWayland, so an X11-only application does not start. There is
+no fractional scaling, no text input protocol, so no IME, no session lock
+protocol, and no primary selection.
+
+A floating dialog is centred and it stays centred. It cannot be moved or
+resized, and one larger than the pane is clipped to it.
+
+Applications that draw their own title bar keep it. wlterm asks for
+server-side decorations, and VS Code and Thunar both draw one anyway, so you
+get a row of window controls you cannot use.
+
+Nested Hyprland has no cursor and no clipboard, for the reasons above, and
+its IPC needs the whole socket path to fit in 107 bytes.
