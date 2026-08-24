@@ -76,6 +76,16 @@ The escape hatch is `ctrl+\` tapped twice inside 700ms. A single press still
 reaches the app. `-quit-key ctrl+q` picks a different key; `-quit-key none`
 intercepts nothing.
 
+Modifiers are held down, not just described. A terminal reports ctrl as a
+bit on the key it modified, and `wl_keyboard.modifiers` says the same, which
+is all an ordinary client needs: foot reads it and gets ctrl+c right. A
+nested compositor does not work that way. It runs its own xkb state machine
+off the key events it is given and never sees a ctrl that was only
+described, so ctrl+c inside a nested Hyprland arrived as a plain c. wlterm
+now presses and releases the modifier key itself, which is what the keyboard
+it stands in for would have done. Caps lock and num lock stay
+described-only, because they latch rather than hold.
+
 The window is maximized, not fullscreen. That distinction is the whole
 difference between a browser you can use and one you cannot: a client told
 it is fullscreen hides its own toolbars, so Chromium drew the page and
@@ -208,6 +218,12 @@ Vulkan inside it works because the dmabuf reaches wlterm the same way:
 ```sh
 ./wlterm -- Hyprland -c ~/.config/hypr/nested.conf   # with exec-once = vkcube
 ```
+
+`nested.conf` binds everything on SUPER, because a terminal in the pane
+wants ctrl and alt for itself: SUPER+D opens rofi, SUPER+Return opens a
+terminal, SUPER+Q closes a window, SUPER+Tab and SUPER+J/K cycle, SUPER+F
+zooms, SUPER+shift+Q leaves. Install `rofi-wayland`; plain rofi is an X11
+program and there is no X server in here.
 
 What it does not get: no keyboard layout of its own (wlterm's map is US
 only), no clipboard between it and the host, and no cursor, because wlterm
@@ -356,6 +372,44 @@ nvidia node mmaps fine and then reads at 0.015 GB/s, which is 242ms for one
 720p frame. `-drm NODE` overrides the choice; `-no-dmabuf` turns the
 protocol off.
 
+## Pointer and idle cost
+
+Two things used to make the pane feel behind the hand, and both are worst
+with a nested compositor, because there every pointer move is a whole
+compositor redrawing its screen.
+
+**Motion is paced to the frame rate.** A host sends one motion escape per
+hardware event and wlterm used to forward every one. A 600-per-second drag
+became 600 repaints a second in the guest, the picture fell behind and
+caught up after the drag stopped, which is the shape of a queue rather than
+a fixed delay. Only the newest position means anything, so the rest are
+dropped: measured into a nested Hyprland at `-fps 120`, a 200/s drag went
+from 200 events delivered a second to 113, and a 600/s drag from 600 to 114.
+Buttons and wheel events are never dropped, and each one flushes the
+position it happened at first, so a click still lands where the pointer was.
+Checked against a page that prints its own events: a click after a 400/s
+drag was delivered at exactly the pixel it happened on.
+
+**A frame identical to the one already on screen is not drawn.** A nested
+compositor redraws on every frame callback whether anything moved or not. An
+idle Hyprland had wlterm compositing, encoding and sending 120 full frames a
+second of a picture that never changed. Each commit is now compared with the
+frame before it, and a match costs nothing past the compare: the client is
+still owed its frame callback and still gets it.
+
+Measured on an idle nested Hyprland at 1000x600, `-fps 120`, 20 seconds:
+
+|  | frames sent | wlterm CPU |
+|---|---|---|
+| before | 119/s | 5.21 s |
+| after | 65/s | 3.83 s |
+
+The rest of the frames genuinely differ; Hyprland alternates between two
+buffers that are not identical even with nothing on screen. The compare
+costs nothing where it fails, because it stops at the first byte that
+differs: vkcube, where every frame is new, measured 19.30s of CPU before and
+19.24s after.
+
 ## Performance
 
 The frame cap defaults to 120, and `-fps 0` uncaps. Sixty is a monitor's
@@ -474,4 +528,11 @@ server-side decorations, and VS Code and Thunar both draw one anyway, so you
 get a row of window controls you cannot use.
 
 Nested Hyprland has no cursor and no clipboard, for the reasons above, and
-its IPC needs the whole socket path to fit in 107 bytes.
+its IPC needs the whole socket path to fit in 107 bytes. It also redraws on
+every frame callback with nothing on screen, so an idle one still costs
+about half the frame rate it is given; wlterm drops the frames that repeat
+but cannot stop it rendering them.
+
+Caps lock and num lock reach a nested compositor as a mask only. Every other
+modifier is held down as a key as well, but those two latch rather than
+hold, so pressing and releasing them would leave the guest inverted.
