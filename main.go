@@ -259,6 +259,12 @@ func main() {
 		}
 	}()
 
+	// Motion is paced to the same clock the frames are. Sending a guest
+	// more positions than there are frames to show them in only asks it to
+	// render work nobody sees.
+	if *fps > 0 {
+		p.motion.interval = time.Second / time.Duration(*fps)
+	}
 	rend := newRenderer(comp, *mode, *layers == "per-window", os.Stdout, *fps)
 	if *stampPath != "" {
 		if f, err := os.Create(*stampPath); err == nil {

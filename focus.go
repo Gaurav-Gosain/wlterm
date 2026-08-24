@@ -256,6 +256,7 @@ func (comp *compositor) setPointerFocus(s *wlSurface, lx, ly int) {
 }
 
 func (comp *compositor) pointerMotion(x, y float64) {
+	stats.motionOut.Add(1)
 	ix, iy := int(x), int(y)
 	comp.seatState.lastPX, comp.seatState.lastPY = ix, iy
 	// The launcher is modal: while it is up, the pointer belongs to it and

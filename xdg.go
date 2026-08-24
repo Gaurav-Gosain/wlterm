@@ -4,6 +4,7 @@ package main
 // itself (attach/damage/frame/commit) since surface life is tied to xdg roles.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"runtime/debug"
 	"time"
@@ -24,6 +25,10 @@ type wlSurface struct {
 	// committed content, copied out of the shm pool
 	content []byte // BGRA rows, w*4 stride
 	w, h    int
+	// back is the frame before this one. Each commit is copied into
+	// whichever of the two is not on screen and the pair take turns, so
+	// comparing a new frame with the last one costs a compare and no copy.
+	back []byte
 
 	role     *xdgSurface
 	sub      *wlSubsurface
@@ -74,10 +79,11 @@ func (s *wlSurface) handle(c *client, id uint32, opcode uint16, r *argReader) {
 
 func (s *wlSurface) commit(c *client) {
 	comp := c.comp
+	contentChanged := false
 	if s.pendingBufSet {
 		if s.pendingBuf != nil {
 			b := s.pendingBuf
-			s.copyFromBuffer(b)
+			contentChanged = s.copyFromBuffer(b)
 			// Release immediately: we copied the pixels.
 			c.event(b.id, 0) // wl_buffer.release
 			comp.commitCount++
@@ -85,6 +91,7 @@ func (s *wlSurface) commit(c *client) {
 		} else {
 			s.content = nil
 			s.w, s.h = 0, 0
+			contentChanged = true
 		}
 		s.pendingBuf = nil
 		s.pendingBufSet = false
@@ -125,9 +132,21 @@ func (s *wlSurface) commit(c *client) {
 	if s.content != nil {
 		if !s.mapped {
 			s.mapped = true
+			contentChanged = true
 			if comp.focus == w {
 				comp.setKeyboardFocus(s)
 			}
+		}
+		// A frame identical to the one already on screen is not worth
+		// compositing, encoding and sending to the terminal. A nested
+		// compositor redraws on every frame callback whether anything moved
+		// or not, so an idle Hyprland had wlterm sending 120 full frames a
+		// second of a picture that never changed. The frame callback is
+		// still owed and is answered above; only the drawing is dropped.
+		if !contentChanged {
+			stats.sameFrames.Add(1)
+			s.pendingDamage = rect{}
+			return
 		}
 		dmg := s.pendingDamage
 		if dmg.empty() {
@@ -233,7 +252,9 @@ func isChildOf(s, top *wlSurface) bool {
 // Keeps BGRA byte order (swizzled later). A client can truncate the backing
 // file after validation; SetPanicOnFault turns the resulting SIGBUS into a
 // recoverable panic instead of killing us.
-func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
+// copyFromBuffer copies a client's pixels in and reports whether they
+// differ from the frame before.
+func (s *wlSurface) copyFromBuffer(b *wlBuffer) (changed bool) {
 	t0 := time.Now()
 	defer func() {
 		d := uint64(time.Since(t0))
@@ -253,14 +274,23 @@ func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
 			logf("fault copying client buffer (truncated pool?): %v", err)
 			s.content = nil
 			s.w, s.h = 0, 0
+			changed = true
 		}
 	}()
+	// Take turns: write into the buffer that is not on screen, so the one
+	// that is stays available to compare against without copying it first.
+	prev, prevW, prevH := s.content, s.w, s.h
+	s.content, s.back = s.back, s.content
 	need := b.w * b.h * 4
 	if cap(s.content) < need {
 		s.content = make([]byte, need)
 	}
 	s.content = s.content[:need]
 	s.w, s.h = b.w, b.h
+	defer func() {
+		changed = changed || b.w != prevW || b.h != prevH ||
+			!bytes.Equal(s.content, prev)
+	}()
 	if b.dma != nil && dmabufSync {
 		ts := time.Now()
 		b.dma.sync(true)
@@ -293,6 +323,7 @@ func (s *wlSurface) copyFromBuffer(b *wlBuffer) {
 			px[i] = 0xff
 		}
 	}
+	return
 }
 
 // ---- xdg_wm_base ----

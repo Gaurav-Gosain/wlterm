@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,6 +56,9 @@ type inputParser struct {
 	// away every answer asked for after it.
 	da1 chan struct{}
 
+	// motion holds pointer motion back to one event a frame.
+	motion *motionPacer
+
 	// frameEdits records whether the terminal passed the frame-edit probe.
 	// setupTerminal writes it once, before any frame is drawn, and the
 	// transport choice reads it.
@@ -71,6 +75,7 @@ type gfxAnswer struct {
 func newInputParser(comp *compositor) *inputParser {
 	return &inputParser{
 		comp:         comp,
+		motion:       &motionPacer{comp: comp},
 		quit:         make(chan struct{}),
 		gotCell:      make(chan struct{}, 2),
 		decrqm1016:   make(chan bool, 1),
@@ -470,8 +475,6 @@ func (p *inputParser) sgrMouse(body string, press bool) {
 	}
 
 	comp := p.comp
-	comp.mu.Lock()
-	defer comp.mu.Unlock()
 
 	if b&64 != 0 { // wheel
 		if press {
@@ -479,15 +482,22 @@ func (p *inputParser) sgrMouse(body string, press bool) {
 			if b&1 == 0 { // 64 = up
 				delta = -15.0
 			}
-			comp.pointerMotion(px, py)
+			// A wheel event is where it happened, so the position it
+			// carries goes first and is not held back.
+			p.motion.now(px, py)
+			comp.mu.Lock()
 			comp.pointerAxis(true, delta)
+			comp.mu.Unlock()
 		}
 		return
 	}
-	comp.pointerMotion(px, py)
+
 	if b&32 != 0 { // motion only
+		stats.motionIn.Add(1)
+		p.motion.post(px, py)
 		return
 	}
+
 	var btn uint32
 	switch b & 3 {
 	case 0:
@@ -499,5 +509,90 @@ func (p *inputParser) sgrMouse(body string, press bool) {
 	case 3:
 		return
 	}
+	// A press is delivered at the position it happened, so any motion still
+	// being held back is sent first and in order.
+	stats.motionIn.Add(1)
+	p.motion.now(px, py)
+	comp.mu.Lock()
 	comp.pointerButton(btn, press)
+	comp.mu.Unlock()
+}
+
+// motionPacer holds pointer motion back to one event a frame.
+//
+// A host sends one motion escape per hardware event and a guest renders a
+// frame per motion event, so a fast drag asked for several hundred repaints
+// a second. Nested, each of those is a whole compositor redrawing its
+// screen, and the picture falls behind the hand and catches up after the
+// drag stops, which is the shape of a queue rather than a fixed delay.
+//
+// Only the newest position means anything, so the ones in between are
+// dropped. Buttons and wheel events are never dropped, and each one flushes
+// the position it happened at before it is delivered, so a click still
+// lands where the pointer was.
+type motionPacer struct {
+	mu       sync.Mutex
+	comp     *compositor
+	interval time.Duration
+	pending  bool
+	x, y     float64
+	last     time.Time
+	timer    *time.Timer
+}
+
+// post records a position and delivers it when the frame it belongs to
+// comes round.
+func (m *motionPacer) post(x, y float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.x, m.y, m.pending = x, y, true
+	if m.interval <= 0 {
+		m.mu.Unlock()
+		m.flush()
+		return
+	}
+	if wait := m.interval - time.Since(m.last); wait > 0 {
+		if m.timer == nil {
+			m.timer = time.AfterFunc(wait, func() {
+				m.mu.Lock()
+				m.timer = nil
+				m.mu.Unlock()
+				m.flush()
+			})
+		}
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	m.flush()
+}
+
+// now records a position and delivers it immediately, for an event that
+// carries a position of its own.
+func (m *motionPacer) now(x, y float64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.x, m.y, m.pending = x, y, true
+	m.mu.Unlock()
+	m.flush()
+}
+
+func (m *motionPacer) flush() {
+	m.mu.Lock()
+	if !m.pending {
+		m.mu.Unlock()
+		return
+	}
+	x, y := m.x, m.y
+	m.pending = false
+	m.last = time.Now()
+	m.mu.Unlock()
+
+	m.comp.mu.Lock()
+	m.comp.pointerMotion(x, y)
+	m.comp.mu.Unlock()
 }

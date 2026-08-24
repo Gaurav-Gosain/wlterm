@@ -52,6 +52,13 @@ type renderStats struct {
 	dmaCopies   atomic.Uint64
 	dmaCopyNs   atomic.Uint64
 	dmaSyncNs   atomic.Uint64
+	// Pointer motion: escapes read off stdin, and events actually
+	// delivered to a client. The gap between them is what coalescing buys.
+	motionIn  atomic.Uint64
+	motionOut atomic.Uint64
+	// sameFrames counts commits whose pixels matched the frame already on
+	// screen, and so cost nothing past the compare.
+	sameFrames atomic.Uint64
 }
 
 var stats renderStats
@@ -818,6 +825,8 @@ func statsLine(elapsed time.Duration) string {
 	lat := time.Duration(stats.latencyNs.Swap(0) / f)
 	pty := stats.ptyBytes.Swap(0)
 	shm := stats.shmBytes.Swap(0)
+	mIn := stats.motionIn.Swap(0)
+	mOut := stats.motionOut.Swap(0)
 	imgs := stats.images.Swap(0)
 	px := stats.dmgPixels.Swap(0)
 	var b strings.Builder
@@ -842,6 +851,12 @@ func statsLine(elapsed time.Duration) string {
 	}
 	if n := stats.emptyWakes.Swap(0); n > 0 {
 		fmt.Fprintf(&b, " empty_wakes=%d", n)
+	}
+	if mIn > 0 || mOut > 0 {
+		fmt.Fprintf(&b, " motion_in=%d motion_out=%d", mIn, mOut)
+	}
+	if n := stats.sameFrames.Swap(0); n > 0 {
+		fmt.Fprintf(&b, " same_frames=%d", n)
 	}
 	if ops := stats.chromeOps.Swap(0); ops > 0 {
 		fmt.Fprintf(&b, " chrome_repaints=%d chrome=%v", ops, time.Duration(stats.chromeNs.Swap(0)/ops))
