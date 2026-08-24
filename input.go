@@ -376,7 +376,7 @@ func (p *inputParser) dispatchKeyEx(code uint32, kittyMods uint32, event int, tr
 		}
 		return
 	}
-	comp.setModifiers(kittyModsToXkb(kittyMods))
+	comp.setModifiersFor(kittyModsToXkb(kittyMods), code)
 	switch event {
 	case 1:
 		comp.key(code, true)
@@ -441,7 +441,7 @@ func (p *inputParser) tapLegacy(code uint32, kittyMods uint32) {
 		delete(comp.swallow, code)
 		return
 	}
-	comp.setModifiers(kittyModsToXkb(kittyMods))
+	comp.setModifiersFor(kittyModsToXkb(kittyMods), code)
 	comp.key(code, true)
 	comp.key(code, false)
 	comp.setModifiers(0)

@@ -167,3 +167,51 @@ func TestMultiModeStillReservesTheFrame(t *testing.T) {
 			"and dock are supposed to be reserved around it", w.area)
 	}
 }
+
+// A nested compositor rebuilds its own modifier state from the key events
+// it is given, so a ctrl described only as a bit on wl_keyboard.modifiers
+// never reaches the guest inside it. wlterm holds the key down as well.
+func TestModifierIsSentAsAKeyAsWellAsAMask(t *testing.T) {
+	comp := newSingleComp(800, 600, 10, 20)
+	comp.modHeld = map[uint32]bool{}
+
+	comp.setModifiersFor(4, 0) // control
+	if !comp.modHeld[29] {
+		t.Errorf("KEY_LEFTCTRL was not held down for the control modifier")
+	}
+	comp.setModifiers(0)
+	if comp.modHeld[29] {
+		t.Errorf("KEY_LEFTCTRL was not released when control cleared")
+	}
+
+	// A terminal that reports the modifier as a key of its own must not get
+	// a second synthetic one on top.
+	comp.key(29, true)
+	comp.setModifiersFor(4, 29)
+	if !comp.modHeld[29] {
+		t.Errorf("a real control press was forgotten")
+	}
+
+	// Caps lock and num lock latch rather than hold, so they stay
+	// described-only: pressing and releasing them would invert the guest.
+	comp.modHeld = map[uint32]bool{}
+	comp.setModifiers(2 | 16)
+	if comp.modHeld[58] || comp.modHeld[69] {
+		t.Errorf("a locking modifier was sent as a key")
+	}
+}
+
+// heldKeys is the wl_keyboard.enter array, so a client given focus while a
+// modifier is down starts from the truth.
+func TestEnterCarriesHeldModifiers(t *testing.T) {
+	comp := newSingleComp(800, 600, 10, 20)
+	comp.modHeld = map[uint32]bool{}
+	if got := len(comp.heldKeys()); got != 0 {
+		t.Fatalf("held keys with nothing down = %d bytes, want 0", got)
+	}
+	comp.setModifiers(4)
+	keys := comp.heldKeys()
+	if len(keys) != 4 || binary.LittleEndian.Uint32(keys) != 29 {
+		t.Errorf("held keys = %v, want the one control key", keys)
+	}
+}

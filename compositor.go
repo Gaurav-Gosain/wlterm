@@ -55,6 +55,10 @@ type compositor struct {
 	// opened yet", which look the same from a window count of zero.
 	windowsAdded int
 
+	// modHeld is which modifier keys are held down, whether the terminal
+	// sent them as keys or wlterm synthesized them from a mask.
+	modHeld map[uint32]bool
+
 	// Tiling state. windows is creation order (master-stack reads it as
 	// master-first); root is the BSP tree over the same set.
 	windows     []*window

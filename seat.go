@@ -39,7 +39,7 @@ func (s *wlSeat) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		// If this client already owns the focused surface, hand it focus
 		// now: a client may bind the keyboard after its window was mapped.
 		if f := c.comp.kbFocus; f != nil && f.client == c {
-			c.event(kid, 1, c.comp.nextSerial(), f.id, []byte{})
+			c.event(kid, 1, c.comp.nextSerial(), f.id, c.comp.heldKeys())
 			c.event(kid, 4, c.comp.nextSerial(), c.comp.seatState.mods, uint32(0), uint32(0), uint32(0))
 		}
 	case 2: // get_touch
