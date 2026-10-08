@@ -501,8 +501,8 @@ wlterm crashed a desktop session once, early on. The rules come from that.
 ## Verifying
 
 - `go test -race ./...` runs the unit tests, the wire tests and the fuzz
-  seeds. CI runs them on amd64 and arm64, and builds for every Linux
-  architecture.
+  seeds. CI runs them on amd64 and arm64. For the other Linux
+  architectures, CI only compiles wlterm. It does not run it there.
 - `./run_pane.sh` runs everything inside a real tuios pane and prints the
   numbers above.
 - `./run_apps.sh` runs every application in "Running applications", each in
