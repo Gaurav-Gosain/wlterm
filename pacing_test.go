@@ -1,7 +1,6 @@
 package main
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -13,50 +12,61 @@ import (
 //
 // It stayed hidden for so long because every benchmark ran at -fps 1000, where
 // the interval is 1ms and the frame cost swamps the error anyway.
+//
+// The loop runs against a fake clock. Measured on the wall clock this test
+// failed 1 run in 3 on a loaded machine (69.2 fps against a floor of 85),
+// where it could not tell the fix from the bug.
 func TestLoopPacesAtTheTargetRateNotTheTargetGap(t *testing.T) {
-	const (
-		fps       = 100
-		frameCost = 5 * time.Millisecond
-		window    = 600 * time.Millisecond
-	)
-	comp := &compositor{renderCh: make(chan struct{}, 1)}
-	r := newRenderer(comp, "shm", false, nil, fps)
-
-	var frames atomic.Int64
-	r.frameFn = func() {
-		time.Sleep(frameCost)
-		frames.Add(1)
+	cases := []struct {
+		name      string
+		fps       int
+		frameCost time.Duration
+		overshoot time.Duration // how late every sleep wakes up
+		want      float64
+	}{
+		{"exact sleeps", 100, 5 * time.Millisecond, 0, 100},
+		// The deadline advances on its own grid, so a sleep that wakes late
+		// is absorbed by the next slot instead of lowering the rate.
+		{"late wake-ups", 100, 5 * time.Millisecond, time.Millisecond, 100},
+		{"120 fps, 2ms frames", 120, 2 * time.Millisecond, 0, 120},
+		// A frame that costs more than the interval cannot be paced at all,
+		// and must not be repaid as a burst later.
+		{"frames slower than the cap", 100, 15 * time.Millisecond, 0, 1000.0 / 15},
+		{"uncapped", 0, 5 * time.Millisecond, 0, 200},
 	}
-	go r.loop()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const window = time.Second
+			clock := time.Unix(1e9, 0)
+			comp := &compositor{renderCh: make(chan struct{}, 1)}
+			r := newRenderer(comp, "shm", false, nil, tc.fps)
+			r.now = func() time.Time { return clock }
+			r.sleep = func(d time.Duration) { clock = clock.Add(d + tc.overshoot) }
 
-	// Keep a frame permanently owed, so the only thing deciding the rate is
-	// the pacing.
-	done := make(chan struct{})
-	go func() {
-		tk := time.NewTicker(time.Millisecond)
-		defer tk.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-tk.C:
+			start := clock
+			frames := 0
+			r.frameFn = func() {
+				clock = clock.Add(tc.frameCost)
+				frames++
+				if clock.Sub(start) >= window {
+					close(comp.renderCh) // ends loop()
+					return
+				}
+				// Keep a frame permanently owed, so the only thing deciding
+				// the rate is the pacing.
 				comp.markDirty()
 			}
-		}
-	}()
+			comp.markDirty()
+			r.loop()
 
-	start := time.Now()
-	time.Sleep(window)
-	close(done)
-	got := float64(frames.Load()) / time.Since(start).Seconds()
-
-	// The old behaviour lands at 1/(10ms+5ms) = 67fps. The correct one lands
-	// at 100. A floor of 85 separates them with room for a loaded machine,
-	// and the ceiling catches a cap that stopped capping.
-	if got < 85 || got > fps*1.1 {
-		t.Fatalf("cap of %d fps with a %v frame delivered %.1f fps; want ~%d "+
-			"(the pre-fix behaviour is ~%.0f)", fps, frameCost, got, fps,
-			1/((time.Second/fps + frameCost).Seconds()))
+			got := float64(frames) / clock.Sub(start).Seconds()
+			if got < tc.want*0.99 || got > tc.want*1.01 {
+				t.Fatalf("cap of %d fps with a %v frame delivered %.1f fps; want %.1f "+
+					"(sleeping the interval after each frame gives %.1f)",
+					tc.fps, tc.frameCost, got, tc.want,
+					1/((time.Second/time.Duration(max(tc.fps, 1)) + tc.frameCost).Seconds()))
+			}
+		})
 	}
 }
 

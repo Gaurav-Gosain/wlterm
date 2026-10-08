@@ -88,12 +88,18 @@ type renderer struct {
 	// pacing can be checked against a frame of known cost without a
 	// compositor, a client or a terminal.
 	frameFn func()
+	// now and sleep are the clock loop() paces against. A test replaces
+	// them with a fake one, so the rate it checks does not depend on how
+	// busy the machine running it is.
+	now   func() time.Time
+	sleep func(time.Duration)
 }
 
 func newRenderer(comp *compositor, mode string, layered bool, out *os.File, maxFPS int) *renderer {
 	r := &renderer{comp: comp, mode: mode, layered: layered, out: out, maxFPS: maxFPS,
 		patches: map[uint32]int{}}
 	r.frameFn = r.frame
+	r.now, r.sleep = time.Now, time.Sleep
 	return r
 }
 
@@ -114,7 +120,7 @@ func (r *renderer) loop() {
 	var next time.Time
 	var prevEnd time.Time
 	for range r.comp.renderCh {
-		recv := time.Now()
+		recv := r.now()
 		// A wake with nothing to draw must not consume a slot of the frame
 		// budget. Two markDirty calls straddling a frame leave a token behind
 		// for a frame that has already been drawn, and paying a full interval
@@ -130,10 +136,10 @@ func (r *renderer) loop() {
 			stats.idleNs.Add(uint64(recv.Sub(prevEnd)))
 		}
 		if d := next.Sub(recv); d > 0 {
-			time.Sleep(d)
+			r.sleep(d)
 			stats.paceNs.Add(uint64(d))
 		}
-		start := time.Now()
+		start := r.now()
 		// Advance the deadline on its own grid, so a Sleep that overshoots by
 		// the scheduler's granularity is absorbed by the next slot instead of
 		// accumulating as lost rate. Resync when we are more than a slot late,
@@ -143,7 +149,7 @@ func (r *renderer) loop() {
 			next = start.Add(minInterval)
 		}
 		r.frameFn()
-		prevEnd = time.Now()
+		prevEnd = r.now()
 	}
 }
 
