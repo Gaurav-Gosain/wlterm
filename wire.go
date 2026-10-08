@@ -181,22 +181,31 @@ func (c *client) deleteID(id uint32) {
 	c.event(1, 1, id) // wl_display.delete_id
 }
 
+// protoError queues wl_display.error and marks the client dead. It runs
+// under comp.mu, so it does not flush: a client that has stopped reading
+// would block the write, and with it every other client and the renderer.
+// readLoop flushes the error once dispatch returns, outside the lock.
 func (c *client) protoError(obj uint32, code uint32, msg string) {
 	c.event(1, 0, obj, code, msg) // wl_display.error
-	c.flush()
 	c.dead = true
 }
 
 // readLoop reads and dispatches messages until the connection dies.
 func (c *client) readLoop() {
+	var fds []int
 	defer func() {
+		// fds the client sent that no request took are ours to close. A
+		// client that sends fds with a malformed request, or hangs up with
+		// fds still queued, would otherwise leave them open here.
+		for _, fd := range fds {
+			syscall.Close(fd)
+		}
 		c.conn.Close()
 		c.comp.mu.Lock()
 		c.comp.clientGone(c)
 		c.comp.mu.Unlock()
 	}()
 	var buf []byte
-	var fds []int
 	rbuf := make([]byte, 65536)
 	oob := make([]byte, 4096)
 	for {

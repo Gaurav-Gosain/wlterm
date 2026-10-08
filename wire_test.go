@@ -132,7 +132,9 @@ func readUntil(t testing.TB, peer *net.UnixConn, d time.Duration, stop func(wire
 				}
 			}
 		}
-		buf = append(buf, rb[:n]...)
+		if n > 0 { // n is -1 when the read fails
+			buf = append(buf, rb[:n]...)
+		}
 		if err != nil {
 			return evs, false
 		}
@@ -229,8 +231,13 @@ func TestMalformedRequestDisconnectsOnlyThatClient(t *testing.T) {
 	cases := []struct {
 		name string
 		msgs [][]byte
+		// code is the wl_display.error code the client must get. A handler
+		// panic caught by dispatch's recover gives errImplementation, so a
+		// case whose code differs from it shows the bounded reader caught
+		// the request first.
+		code uint32
 	}{
-		{"get_registry with no new_id", [][]byte{request(1, 1)}},
+		{"get_registry with no new_id", [][]byte{request(1, 1)}, errInvalidMethod},
 		{"bind with a string longer than the message", [][]byte{
 			request(1, 1, uint32(2)),
 			func() []byte {
@@ -238,7 +245,7 @@ func TestMalformedRequestDisconnectsOnlyThatClient(t *testing.T) {
 				binary.LittleEndian.PutUint32(m[12:], 4096) // the string's length
 				return m
 			}(),
-		}},
+		}, 0}, // the empty interface name is an unknown global
 		{"bind with a string length that wraps the padding", [][]byte{
 			request(1, 1, uint32(2)),
 			func() []byte {
@@ -246,12 +253,12 @@ func TestMalformedRequestDisconnectsOnlyThatClient(t *testing.T) {
 				binary.LittleEndian.PutUint32(m[12:], 0xffffffff)
 				return m
 			}(),
-		}},
+		}, 0}, // the empty interface name is an unknown global
 		{"create_pool with no fd", [][]byte{
 			request(1, 1, uint32(2)),
 			request(2, 0, uint32(2), "wl_shm", uint32(1), uint32(3)),
 			request(3, 0, uint32(4), uint32(4096)), // new_id, (fd missing), size
-		}},
+		}, 1}, // wl_shm refuses fd -1 as an invalid pool
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,6 +272,9 @@ func TestMalformedRequestDisconnectsOnlyThatClient(t *testing.T) {
 			})
 			if !ok {
 				t.Fatalf("the malformed client got no wl_display.error within 5s (events: %d)", len(evs))
+			}
+			if code := evs[len(evs)-1].u32(1); code != tc.code {
+				t.Errorf("wl_display.error code %d, want %d", code, tc.code)
 			}
 			select {
 			case <-badDone:
@@ -342,4 +352,92 @@ func FuzzDispatch(f *testing.F) {
 		}
 		comp.mu.Unlock()
 	})
+}
+
+// fds a client sends ride along with its requests, and readLoop queues them
+// until a request takes one. Those still queued when the client went away
+// were never closed. A malformed request now ends the connection on purpose,
+// so a client could send fds with one, reconnect and repeat, and leave more
+// fds open in wlterm on every round.
+func TestQueuedFdsAreClosedWhenTheClientLeaves(t *testing.T) {
+	const name = "wlterm-test-queued-fd"
+	comp := newSingleComp(400, 200, 10, 20)
+	_, peer, done := connect(t, comp)
+
+	fd, err := memfd(name)
+	if err != nil {
+		t.Fatalf("memfd: %v", err)
+	}
+	// wl_display.sync with its argument missing: no request takes the fd.
+	_, _, err = peer.WriteMsgUnix(request(1, 0), syscall.UnixRights(fd), nil)
+	syscall.Close(fd) // the only copy left is the one wlterm received
+	if err != nil {
+		t.Fatalf("send the fd: %v", err)
+	}
+	if _, ok := readUntil(t, peer, 5*time.Second, func(e wireEvent) bool {
+		return e.obj == 1 && e.opcode == 0
+	}); !ok {
+		t.Fatalf("the malformed request got no wl_display.error")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection was not closed")
+	}
+
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("list own fds: %v", err)
+	}
+	for _, e := range ents {
+		if target, err := os.Readlink("/proc/self/fd/" + e.Name()); err == nil && strings.Contains(target, name) {
+			t.Errorf("fd %s -> %s is still open after the client left", e.Name(), target)
+		}
+	}
+}
+
+// protoError used to flush the client's queued events itself, and it runs
+// under comp.mu. A client that stops reading fills its socket, the write
+// blocks, and the global lock is held until that client reads again: every
+// other client and the renderer wait on it. The error must be flushed by
+// readLoop, outside the lock.
+func TestProtocolErrorDoesNotWriteUnderTheLock(t *testing.T) {
+	comp := newSingleComp(400, 200, 10, 20)
+	_, good, _ := connect(t, comp)
+	bad, badPeer, badDone := connect(t, comp)
+	// A small send buffer, so the bad client's events fill it quickly.
+	if err := bad.conn.SetWriteBuffer(4096); err != nil {
+		t.Fatalf("SetWriteBuffer: %v", err)
+	}
+
+	// 2000 syncs queue 4000 events (48 KB) the bad client never reads, then
+	// a malformed sync ends its connection. All of it goes in one write, so
+	// readLoop dispatches it all before it flushes.
+	var stream []byte
+	for i := range 2000 {
+		stream = append(stream, request(1, 0, uint32(100+i))...)
+	}
+	stream = append(stream, request(1, 0)...)
+	send(t, badPeer, stream)
+
+	// Give readLoop time to reach the malformed request and block on the
+	// full socket.
+	time.Sleep(200 * time.Millisecond)
+	roundTrip(t, good, 50)
+	if !comp.mu.TryLock() {
+		t.Fatalf("the compositor lock is held while a client that stopped reading is written to")
+	}
+	comp.mu.Unlock()
+
+	// Once the bad client reads, it gets its error and the connection ends.
+	if _, ok := readUntil(t, badPeer, 5*time.Second, func(e wireEvent) bool {
+		return e.obj == 1 && e.opcode == 0
+	}); !ok {
+		t.Fatalf("the bad client got no wl_display.error once it read")
+	}
+	select {
+	case <-badDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the bad client's connection was not closed")
+	}
 }
