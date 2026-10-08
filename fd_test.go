@@ -91,3 +91,21 @@ func TestImportedDmabufFdIsNotInherited(t *testing.T) {
 		}
 	}
 }
+
+// The keymap is the same for every compositor in the process. It used to be
+// compiled once per compositor into one shared variable, so each new
+// compositor ran xkbcli again and leaked the previous memfd. The fuzz target
+// makes a compositor per input, and a long run leaked one fd per input.
+func TestKeymapIsCompiledOncePerProcess(t *testing.T) {
+	if _, err := exec.LookPath("xkbcli"); err != nil {
+		t.Skip("xkbcli is not installed; the keymap cannot be compiled")
+	}
+	first := newSingleComp(400, 200, 10, 20).keymap()
+	second := newSingleComp(400, 200, 10, 20).keymap()
+	if first == nil || second == nil {
+		t.Fatalf("no keymap was made")
+	}
+	if first.fd != second.fd {
+		t.Errorf("a second compositor compiled its own keymap (fd %d, then fd %d)", first.fd, second.fd)
+	}
+}

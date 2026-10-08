@@ -116,7 +116,6 @@ type compositor struct {
 	// maxFPS is the frame cap, 0 for uncapped. wl_output reports it as the
 	// refresh rate, because it is the rate a client's frames are shown at.
 	maxFPS      int
-	keymapOnce  sync.Once
 	commitCount uint64
 	commitBytes uint64
 }

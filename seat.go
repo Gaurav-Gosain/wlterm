@@ -5,6 +5,7 @@ package main
 
 import (
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -150,11 +151,17 @@ type keymapInfo struct {
 	size int
 }
 
-var cachedKeymap *keymapInfo
+// The keymap is the same for every compositor in the process, so it is
+// compiled once per process. A per-compositor once over a shared result ran
+// xkbcli again for each new compositor and leaked the previous memfd.
+var (
+	keymapOnce   sync.Once
+	cachedKeymap *keymapInfo
+)
 
-// keymap compiles a keymap once and keeps it in a memfd.
+// keymap compiles a keymap once per process and keeps it in a memfd.
 func (comp *compositor) keymap() *keymapInfo {
-	comp.keymapOnce.Do(func() {
+	keymapOnce.Do(func() {
 		out, err := exec.Command("xkbcli", "compile-keymap", "--layout", "us").Output()
 		if err != nil {
 			logf("xkbcli failed: %v", err)
