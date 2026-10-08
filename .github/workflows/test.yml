@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 runs natively: the memfd_create number differs per
+        # architecture, and a cross-build compiles a wrong one without
+        # complaint.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install xkbcli
+        # The keymap is compiled with xkbcli at run time, and the keymap
+        # tests need it.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-tools
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      # go test also runs every Fuzz target's seed corpus.
+      - run: go test -race -count=1 ./...
+
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build for every Linux architecture
+        run: |
+          for arch in amd64 386 arm arm64 riscv64 loong64 s390x ppc64 ppc64le mips mipsle mips64 mips64le; do
+            echo "linux/$arch"
+            GOOS=linux GOARCH=$arch go build -o /dev/null ./...
+          done
