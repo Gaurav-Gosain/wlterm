@@ -18,6 +18,11 @@ const (
 	btnLeft   = 0x110
 	btnRight  = 0x111
 	btnMiddle = 0x112
+	// The two side buttons of a five-button mouse, then two more.
+	btnSide    = 0x113
+	btnExtra   = 0x114
+	btnForward = 0x115
+	btnBack    = 0x116
 )
 
 // quitWindow is how close together the two taps of the escape hatch have to
@@ -476,17 +481,30 @@ func (p *inputParser) sgrMouse(body string, press bool) {
 
 	comp := p.comp
 
-	if b&64 != 0 { // wheel
+	// The SGR button code is a group in bits 6 and 7, a button within the
+	// group in bits 0 and 1, motion in bit 5 and the modifiers in bits 2 to
+	// 4. Group 0 is buttons 1-3, group 64 the four wheel directions, group
+	// 128 buttons 8-11 (back, forward and two more).
+	const (
+		groupButtons = 0
+		groupWheel   = 64
+		groupExtra   = 128
+	)
+	group, which := b&(64|128), b&3
+
+	if group == groupWheel && b&32 == 0 {
 		if press {
+			// 64 up and 65 down are the vertical wheel, 66 left and 67
+			// right the horizontal one. Up and left are negative.
 			delta := 15.0
-			if b&1 == 0 { // 64 = up
+			if which&1 == 0 {
 				delta = -15.0
 			}
 			// A wheel event is where it happened, so the position it
 			// carries goes first and is not held back.
 			p.motion.now(px, py)
 			comp.mu.Lock()
-			comp.pointerAxis(true, delta)
+			comp.pointerAxis(which&2 == 0, delta)
 			comp.mu.Unlock()
 		}
 		return
@@ -499,14 +517,23 @@ func (p *inputParser) sgrMouse(body string, press bool) {
 	}
 
 	var btn uint32
-	switch b & 3 {
-	case 0:
-		btn = btnLeft
-	case 1:
-		btn = btnMiddle
-	case 2:
-		btn = btnRight
-	case 3:
+	switch group {
+	case groupButtons:
+		switch which {
+		case 0:
+			btn = btnLeft
+		case 1:
+			btn = btnMiddle
+		case 2:
+			btn = btnRight
+		case 3:
+			return
+		}
+	case groupExtra:
+		// Buttons 8 and 9 are back and forward. Without this group they
+		// decoded as a left click, so "back" in a guest browser clicked.
+		btn = [...]uint32{btnSide, btnExtra, btnForward, btnBack}[which]
+	default:
 		return
 	}
 	// A press is delivered at the position it happened, so any motion still
