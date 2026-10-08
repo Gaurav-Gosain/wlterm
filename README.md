@@ -477,6 +477,11 @@ wlterm crashed a desktop session once, early on. The rules come from that.
   before mapping, reads are bounds-checked and run under
   `debug.SetPanicOnFault`, because a client can truncate a pool after
   validation.
+- Client requests are treated as hostile too. A request that is shorter
+  than its signature, or that makes its handler panic, gets
+  `wl_display.error` and closes that client only. The other clients and
+  the renderer continue. `FuzzDispatch` feeds random request streams to
+  the dispatcher.
 - Outbound frames use a fixed 8-slot ring of `/dev/shm` files, unlinked on
   reuse and on every exit path, so a terminal that never unlinks cannot
   make wlterm leak tmpfs at frame rate.

@@ -16,12 +16,23 @@ type wlFixed int32 // 24.8 signed fixed point
 
 func fixed(f float64) wlFixed { return wlFixed(f * 256) }
 
+// argReader decodes a request's arguments. The bytes and fds come from the
+// client, so neither the length nor the fd count can be trusted: a read past
+// the end returns a zero value (or -1 for an fd, never a real descriptor) and
+// marks the reader short, and the dispatcher turns that into a protocol error
+// for the client that sent it.
 type argReader struct {
-	data []byte
-	fds  *[]int
+	data  []byte
+	fds   *[]int
+	short bool
 }
 
 func (r *argReader) uint() uint32 {
+	if len(r.data) < 4 {
+		r.short = true
+		r.data = nil
+		return 0
+	}
 	v := binary.LittleEndian.Uint32(r.data)
 	r.data = r.data[4:]
 	return v
@@ -33,12 +44,23 @@ func (r *argReader) string() string {
 	if n == 0 {
 		return ""
 	}
-	pad := (n + 3) &^ 3
+	// Compare in uint64: a declared length near 2^32 wraps the padding
+	// arithmetic in uint32 back to a small number.
+	pad := (uint64(n) + 3) &^ 3
+	if pad > uint64(len(r.data)) {
+		r.short = true
+		r.data = nil
+		return ""
+	}
 	s := string(r.data[:n-1])
 	r.data = r.data[pad:]
 	return s
 }
 func (r *argReader) fd() int {
+	if r.fds == nil || len(*r.fds) == 0 {
+		r.short = true
+		return -1
+	}
 	fd := (*r.fds)[0]
 	*r.fds = (*r.fds)[1:]
 	return fd
@@ -205,21 +227,53 @@ func (c *client) readLoop() {
 			if len(buf) < size {
 				break
 			}
-			r := &argReader{data: buf[8:size], fds: &fds}
-			c.comp.mu.Lock()
-			if !c.dead {
-				if obj := c.get(objID); obj != nil {
-					obj.handle(c, objID, opcode, r)
-				} else {
-					logf("request for unknown object %d op %d", objID, opcode)
-				}
-			}
-			c.comp.mu.Unlock()
+			c.dispatch(objID, opcode, &argReader{data: buf[8:size], fds: &fds})
 			buf = buf[size:]
 		}
 		c.flush()
 		if c.dead {
 			return
 		}
+	}
+}
+
+// wl_display.error codes.
+const (
+	errInvalidMethod  = 1
+	errImplementation = 3
+)
+
+// dispatch runs one request under the compositor lock.
+//
+// A client is hostile until shown otherwise, so a request that is too short
+// for its signature, or a handler that panics on what it was given, costs
+// that client its connection and nothing else. The recover has to sit inside
+// the locked section and run before the unlock. A panic that escapes with the
+// lock held reaches readLoop's deferred cleanup, which takes the same lock on
+// the same goroutine and deadlocks: every client and the renderer stop, and
+// the panic is never printed.
+func (c *client) dispatch(objID uint32, opcode uint16, r *argReader) {
+	c.comp.mu.Lock()
+	defer c.comp.mu.Unlock()
+	if c.dead {
+		return
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			logf("client pid=%d: request op %d on object %d panicked: %v; disconnecting it",
+				c.pid, opcode, objID, p)
+			c.protoError(objID, errImplementation, "internal error handling request")
+		}
+	}()
+	obj := c.get(objID)
+	if obj == nil {
+		logf("request for unknown object %d op %d", objID, opcode)
+		return
+	}
+	obj.handle(c, objID, opcode, r)
+	if r.short && !c.dead {
+		logf("client pid=%d: %s op %d is shorter than its signature; disconnecting it",
+			c.pid, obj.iface(), opcode)
+		c.protoError(objID, errInvalidMethod, "request is shorter than its signature")
 	}
 }
