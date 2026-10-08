@@ -153,6 +153,72 @@ func roundTrip(t testing.TB, peer *net.UnixConn, cb uint32) []wireEvent {
 	return evs
 }
 
+// mapSurfaceFor gives the client a toplevel that covers the pane, without
+// going through xdg-shell, so the pointer has something of the client's to
+// land on.
+func mapSurfaceFor(comp *compositor, c *client, id uint32) {
+	comp.mu.Lock()
+	defer comp.mu.Unlock()
+	surf := &wlSurface{id: id, client: c, w: comp.widthPx, h: comp.heightPx, mapped: true,
+		content: make([]byte, comp.widthPx*comp.heightPx*4)}
+	comp.windows = append(comp.windows, &window{top: &xdgToplevel{surf: surf, client: c}})
+	comp.relayout()
+}
+
+// The vkcube crash. wl_pointer.frame arrived in wl_seat version 5, and a
+// client that bound an older seat has no listener slot for it. libwayland
+// aborts on such an event rather than skipping it: vkcube binds wl_seat v1
+// and died with "listener function for opcode 5 of wl_pointer is NULL" on the
+// first pointer motion. The same rule already holds for repeat_info.
+func TestPointerFrameFollowsTheBoundSeatVersion(t *testing.T) {
+	const (
+		registry = 2
+		seat     = 3
+		pointer  = 4
+		surface  = 20
+	)
+	for _, version := range []uint32{1, 4, 5} {
+		t.Run("wl_seat v"+string(rune('0'+version)), func(t *testing.T) {
+			comp := newSingleComp(400, 200, 10, 20)
+			c, peer, _ := connect(t, comp)
+			send(t, peer,
+				request(1, 1, uint32(registry)),
+				request(registry, 0, uint32(3), "wl_seat", version, uint32(seat)),
+				request(seat, 0, uint32(pointer)))
+			roundTrip(t, peer, 10)
+			mapSurfaceFor(comp, c, surface)
+
+			comp.mu.Lock()
+			comp.pointerMotion(50, 50) // enter, then motion
+			comp.pointerButton(btnLeft, true)
+			comp.pointerButton(btnLeft, false)
+			comp.pointerAxis(true, 15)
+			comp.pointerMotion(500, 500) // off the window: leave
+			comp.mu.Unlock()
+			evs := roundTrip(t, peer, 11)
+
+			seen := map[uint16]int{}
+			for _, e := range evs {
+				if e.obj == pointer {
+					seen[e.opcode]++
+				}
+			}
+			for _, op := range []uint16{0, 1, 2, 3, 4} { // enter leave motion button axis
+				if seen[op] == 0 {
+					t.Errorf("no wl_pointer event with opcode %d; got %v", op, seen)
+				}
+			}
+			if version < 5 && seen[5] > 0 {
+				t.Errorf("sent %d wl_pointer.frame events to a client that bound wl_seat v%d; "+
+					"frame needs v5 and libwayland aborts the client", seen[5], version)
+			}
+			if version >= 5 && seen[5] == 0 {
+				t.Errorf("a wl_seat v%d client got no wl_pointer.frame", version)
+			}
+		})
+	}
+}
+
 // One malformed request hung the whole compositor. wl_display.get_registry
 // with its argument missing panicked in the argument reader while the global
 // lock was held, and the reader's deferred cleanup then took the same lock on

@@ -239,7 +239,7 @@ func (comp *compositor) setPointerFocus(s *wlSurface, lx, ly int) {
 		for _, p := range comp.seatState.pointers {
 			if p.c == old.client {
 				p.c.event(p.id, 1, comp.nextSerial(), old.id) // leave
-				p.c.event(p.id, 5)                            // frame
+				p.frame()
 				p.c.flush()
 			}
 		}
@@ -248,7 +248,7 @@ func (comp *compositor) setPointerFocus(s *wlSurface, lx, ly int) {
 		for _, p := range comp.seatState.pointers {
 			if p.c == s.client {
 				p.c.event(p.id, 0, comp.nextSerial(), s.id, fixed(float64(lx)), fixed(float64(ly)))
-				p.c.event(p.id, 5)
+				p.frame()
 				p.c.flush()
 			}
 		}
@@ -278,7 +278,7 @@ func (comp *compositor) pointerMotion(x, y float64) {
 			continue
 		}
 		p.c.event(p.id, 2, nowMs(), fx, fy) // motion
-		p.c.event(p.id, 5)                  // frame
+		p.frame()
 		p.c.flush()
 	}
 }
@@ -310,7 +310,7 @@ func (comp *compositor) pointerButton(btn uint32, pressed bool) {
 			continue
 		}
 		p.c.event(p.id, 3, comp.nextSerial(), nowMs(), btn, state)
-		p.c.event(p.id, 5)
+		p.frame()
 		p.c.flush()
 	}
 }
@@ -339,7 +339,7 @@ func (comp *compositor) pointerAxis(vertical bool, value float64) {
 			continue
 		}
 		p.c.event(p.id, 4, nowMs(), axis, fixed(value))
-		p.c.event(p.id, 5)
+		p.frame()
 		p.c.flush()
 	}
 }

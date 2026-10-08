@@ -19,11 +19,11 @@ func (s *wlSeat) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	case 0: // get_pointer
 		pid := r.uint()
 		c.objects[pid] = wlPointer{}
-		c.comp.seatState.pointers = append(c.comp.seatState.pointers, seatRes{c, pid})
+		c.comp.seatState.pointers = append(c.comp.seatState.pointers, seatRes{c, pid, s.version})
 	case 1: // get_keyboard
 		kid := r.uint()
 		c.objects[kid] = wlKeyboard{}
-		c.comp.seatState.keyboards = append(c.comp.seatState.keyboards, seatRes{c, kid})
+		c.comp.seatState.keyboards = append(c.comp.seatState.keyboards, seatRes{c, kid, s.version})
 		km := c.comp.keymap()
 		if km != nil {
 			c.event(kid, 0, uint32(1), fdArg(km.fd), uint32(km.size)) // keymap xkb_v1
@@ -49,9 +49,23 @@ func (s *wlSeat) handle(c *client, id uint32, opcode uint16, r *argReader) {
 	}
 }
 
+// seatRes is a wl_pointer or wl_keyboard a client holds. version is the
+// wl_seat version the client bound, which the pointer and keyboard inherit:
+// every event newer than it must be held back, because libwayland aborts a
+// client on an event its listener has no slot for.
 type seatRes struct {
-	c  *client
-	id uint32
+	c       *client
+	id      uint32
+	version uint32
+}
+
+// frame ends a group of pointer events. wl_pointer.frame arrived in wl_seat
+// version 5. vkcube binds v1 and aborted with "listener function for opcode
+// 5 of wl_pointer is NULL" on its first pointer motion before this check.
+func (p seatRes) frame() {
+	if p.version >= 5 {
+		p.c.event(p.id, 5)
+	}
 }
 
 type seatState struct {
