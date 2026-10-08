@@ -106,13 +106,16 @@ type compositor struct {
 	pendingCB    []frameCB
 
 	// frame is the composited output canvas (RGBA).
-	frame       []byte
-	frameW      int
-	frameH      int
-	damage      rect
-	dirty       bool
-	dirtyAt     time.Time
-	renderCh    chan struct{}
+	frame    []byte
+	frameW   int
+	frameH   int
+	damage   rect
+	dirty    bool
+	dirtyAt  time.Time
+	renderCh chan struct{}
+	// maxFPS is the frame cap, 0 for uncapped. wl_output reports it as the
+	// refresh rate, because it is the rate a client's frames are shown at.
+	maxFPS      int
 	keymapOnce  sync.Once
 	commitCount uint64
 	commitBytes uint64
@@ -163,6 +166,15 @@ func (r rect) clip(w, h int) rect {
 		r.y1 = h
 	}
 	return r
+}
+
+// refreshMHz is the wl_output refresh rate: the frame cap, or 60 Hz when
+// there is no cap to report.
+func (comp *compositor) refreshMHz() int32 {
+	if comp.maxFPS <= 0 {
+		return 60000
+	}
+	return int32(comp.maxFPS * 1000)
 }
 
 func (comp *compositor) nextSerial() uint32 {
@@ -311,7 +323,7 @@ func (wlRegistry) handle(c *client, id uint32, opcode uint16, r *argReader) {
 		// and toolkits that size themselves from it drew everything huge.
 		c.event(newID, 0, int32(0), int32(0), int32(comp.widthPx*254/960), int32(comp.heightPx*254/960), int32(0), "wlterm", "pane", int32(0))
 		// mode: flags(current|preferred), w, h, refresh mHz
-		c.event(newID, 1, uint32(3), int32(comp.widthPx), int32(comp.heightPx), int32(60000))
+		c.event(newID, 1, uint32(3), int32(comp.widthPx), int32(comp.heightPx), comp.refreshMHz())
 		if version >= 2 {
 			c.event(newID, 3, int32(1)) // scale 1
 			c.event(newID, 2)           // done

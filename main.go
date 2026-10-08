@@ -172,6 +172,7 @@ func main() {
 			deltaMaxFPS, orUncapped(*fps))
 		*fps = deltaMaxFPS
 	}
+	comp.maxFPS = *fps
 	kind := "single-app"
 	if *multi {
 		kind = "multi-surface"
