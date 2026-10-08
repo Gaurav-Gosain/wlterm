@@ -482,6 +482,9 @@ wlterm crashed a desktop session once, early on. The rules come from that.
   `wl_display.error` and closes that client only. The other clients and
   the renderer continue. `FuzzDispatch` feeds random request streams to
   the dispatcher.
+- The keymap and the dmabuf format table are memfds that every client
+  shares. They are sealed, so no client can change them. They and every
+  imported dmabuf are close-on-exec, so a launched program never holds them.
 - Outbound frames use a fixed 8-slot ring of `/dev/shm` files, unlinked on
   reuse and on every exit path, so a terminal that never unlinks cannot
   make wlterm leak tmpfs at frame rate.

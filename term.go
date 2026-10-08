@@ -12,8 +12,6 @@ import (
 	"unsafe"
 )
 
-func pointerOf(b *byte) uintptr { return uintptr(unsafe.Pointer(b)) }
-
 type termios struct {
 	Iflag, Oflag, Cflag, Lflag uint32
 	Line                       uint8

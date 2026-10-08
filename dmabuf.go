@@ -153,26 +153,11 @@ func initDmabuf(override string) bool {
 	}
 	// Seal it: the table is shared with every client and must never change,
 	// and a sealed memfd cannot be shrunk under us into a SIGBUS.
-	const fSeal = 1033 // F_ADD_SEALS
-	const sealAll = 0x0001 | 0x0002 | 0x0004 | 0x0008
-	syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), fSeal, sealAll)
+	sealShared(fd)
 	formatTableFd, formatTableSize = fd, len(buf)
 	dmabufReady = true
 	logf("dmabuf: ready, device=%s dev=0x%x formats=%d", node, rdev, len(dmabufFormats))
 	return true
-}
-
-// Go's syscall package does not export memfd_create; the number is stable ABI.
-const sysMemfdCreate = 319 // linux/amd64
-
-func memfd(name string) (int, error) {
-	b := append([]byte(name), 0)
-	fd, _, errno := syscall.Syscall(sysMemfdCreate,
-		uintptr(unsafe.Pointer(&b[0])), uintptr(0x0001|0x0002), 0) // CLOEXEC|ALLOW_SEALING
-	if errno != 0 {
-		return -1, errno
-	}
-	return int(fd), nil
 }
 
 // ---- zwp_linux_dmabuf_v1 --------------------------------------------------
@@ -399,7 +384,9 @@ func (p *dmabufParams) build(c *client, w, h int32, format, flags uint32) (*wlBu
 		logf("dmabuf: mmap refused: %v", err)
 		return nil, paramsErrInvalidFmt, "dmabuf is not CPU-mappable"
 	}
-	dup, err := syscall.Dup(pl.fd)
+	// CLOEXEC, or every program launched after this keeps the client's
+	// buffer, and the GPU memory behind it, alive.
+	dup, err := dupCloexec(pl.fd)
 	if err != nil {
 		dup = -1
 	}

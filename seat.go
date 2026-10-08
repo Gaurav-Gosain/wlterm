@@ -160,27 +160,21 @@ func (comp *compositor) keymap() *keymapInfo {
 			logf("xkbcli failed: %v", err)
 			return
 		}
-		fd, err := memfdCreate("wlterm-keymap")
+		fd, err := memfd("wlterm-keymap")
 		if err != nil {
 			logf("memfd: %v", err)
 			return
 		}
 		if _, err := syscall.Write(fd, out); err != nil {
 			logf("keymap write: %v", err)
+			syscall.Close(fd)
 			return
 		}
+		// Every client maps this same fd, so no client may change it.
+		sealShared(fd)
 		cachedKeymap = &keymapInfo{fd: fd, size: len(out)}
 	})
 	return cachedKeymap
-}
-
-func memfdCreate(name string) (int, error) {
-	nameb, _ := syscall.BytePtrFromString(name)
-	r0, _, errno := syscall.Syscall(319 /* memfd_create */, pointerOf(nameb), 0, 0)
-	if errno != 0 {
-		return -1, errno
-	}
-	return int(r0), nil
 }
 
 func nowMs() uint32 { return uint32(time.Now().UnixNano() / 1e6) }
